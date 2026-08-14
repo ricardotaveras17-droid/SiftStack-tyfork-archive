@@ -16,8 +16,6 @@ from pathlib import Path
 import config
 from config import (
     LOG_DIR,
-    NOTICE_TYPES,
-    OUTPUT_DIR,
     SAVED_SEARCHES,
     SavedSearch,
 )
@@ -34,7 +32,12 @@ def _filter_searches(
     counties: list[str] | None,
     types: list[str] | None,
 ) -> list[SavedSearch]:
-    """Filter SAVED_SEARCHES by county and/or notice type."""
+    """Filter SAVED_SEARCHES by county and/or notice type.
+
+    Used by the Apify actor_main entrypoint (dormant — daily/historical
+    CLI modes have been removed since the primary data source is now
+    NJLisPendens + Modal, not tnpublicnotice.com).
+    """
     searches = list(SAVED_SEARCHES)
 
     if counties:
@@ -59,15 +62,8 @@ def _preflight_check(mode: str) -> list[str]:
     failures: list[str] = []
 
     # ── Credential checks (mode-dependent) ──────────────────────────
-    scrape_modes = {"daily", "historical"}
-    enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
+    enrichment_modes = {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
-
-    if mode in scrape_modes:
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
-        if not config.CAPTCHA_API_KEY:
-            failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -90,36 +86,13 @@ def _preflight_check(mode: str) -> list[str]:
         if not config.TRESTLE_API_KEY:
             failures.append("TRESTLE_API_KEY not set (required for phone validation)")
 
-    # ── Connectivity checks (only for scrape modes) ─────────────────
-    if mode in scrape_modes:
-        import requests as _requests
-        try:
-            resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
-            if resp.status_code >= 500:
-                failures.append(f"tnpublicnotice.com returned {resp.status_code} — site may be down")
-        except Exception as e:
-            failures.append(f"Cannot reach tnpublicnotice.com: {e}")
+    if mode == "nj-scrape":
+        if not config.NJLISPENDENS_EMAIL or not config.NJLISPENDENS_PASSWORD:
+            failures.append("NJLISPENDENS_EMAIL / NJLISPENDENS_PASSWORD not set")
 
-    # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
-        import requests as _requests
-        try:
-            resp = _requests.get(
-                f"https://2captcha.com/res.php?key={config.CAPTCHA_API_KEY}&action=getbalance",
-                timeout=10,
-            )
-            balance_text = resp.text.strip()
-            try:
-                balance = float(balance_text)
-                if balance < 0.50:
-                    failures.append(f"2Captcha balance too low: ${balance:.2f} (need at least $0.50)")
-                else:
-                    logger.info("Preflight: 2Captcha balance: $%.2f", balance)
-            except ValueError:
-                if "ERROR" in balance_text:
-                    failures.append(f"2Captcha API key invalid: {balance_text}")
-        except Exception as e:
-            logger.warning("Preflight: Could not check 2Captcha balance: %s", e)
+    # (connectivity + 2Captcha balance checks removed along with the
+    #  daily/historical CLI modes — they only ran for tnpublicnotice.com
+    #  scraping. NJ scrapers use their own site-specific health checks.)
 
     return failures
 
@@ -911,6 +884,13 @@ def _run_csv_import(args) -> None:
             if not n.county.strip():
                 n.county = county
 
+    # Override notice_type if provided (for CSVs without notice_type column)
+    notice_type = getattr(args, "notice_type", None)
+    if notice_type:
+        for n in notices:
+            if not n.notice_type.strip():
+                n.notice_type = notice_type.strip().lower()
+
     logging.info("Total: %d records from %d CSV(s)", len(notices), len(csv_paths))
 
     # Build pipeline options
@@ -955,7 +935,9 @@ def _run_csv_import(args) -> None:
         do_enrich = not getattr(args, "no_enrich", False)
         do_skip_trace = not getattr(args, "no_skip_trace", False)
 
-        csv_infos = write_datasift_split_csvs(notices)
+        # List name: CLI override, or let datasift_formatter use NOTICE_TYPE_TO_CATEGORY
+        upload_list_name = getattr(args, "list_name", None) or ""
+        csv_infos = write_datasift_split_csvs(notices, list_name=upload_list_name)
         for info in csv_infos:
             logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
 
@@ -978,10 +960,194 @@ def _run_csv_import(args) -> None:
 
         if upload_result.get("success"):
             logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
+            if do_skip_trace:
+                logging.info(
+                    "After skip trace finishes in DataSift, run phone validation:\n"
+                    "  python src/main.py phone-validate --list-name \"%s\"",
+                    csv_infos[0].get("list_name", "SiftStack"),
+                )
         else:
             logging.error("DataSift upload failed: %s", upload_result.get("message"))
 
     logging.info("Done — %d records exported", len(notices))
+
+
+def _run_nj_sheriff(args) -> None:
+    """Scrape NJ sheriff sales from salesweb.civilview.com for Essex/Middlesex/Union.
+
+    Pulls active sales, writes a CSV via the standard data_formatter path.
+    Does NOT run the full TN enrichment pipeline — these records go straight
+    to CSV for manual review or DataSift upload.
+    """
+    from nj_sheriff_sales import scrape_all as sheriff_scrape_all
+    from dedup_tracker import load_tracking, save_tracking, filter_new
+
+    raw_counties = getattr(args, "counties", None)
+    counties = None
+    if raw_counties and raw_counties.lower() != "all":
+        counties = [c.strip() for c in raw_counties.split(",")]
+
+    notices = sheriff_scrape_all(counties=counties)
+    if not notices:
+        logging.warning("No sheriff sales parsed — check site availability")
+        return
+
+    # Cross-run dedup: drop records we've already processed in a prior run.
+    # Same tracking file is shared with Modal when civilview runs via the
+    # weekly cron (Modal writes to /tracking/ in a Volume; local CLI uses
+    # config.LOCAL_TRACKING_FILE).
+    tracking = load_tracking(config.LOCAL_TRACKING_FILE)
+    new_notices, skipped = filter_new(notices, "civilview_sheriff", tracking)
+    logging.info(
+        "CivilView sheriff dedup: %d new / %d skipped (already processed)",
+        len(new_notices), skipped,
+    )
+
+    if not new_notices:
+        save_tracking(tracking, config.LOCAL_TRACKING_FILE)
+        logging.info("No new CivilView sheriff records this run")
+        return
+
+    from data_formatter import deduplicate, write_csv
+    new_notices = deduplicate(new_notices)
+    csv_path = write_csv(new_notices)
+
+    # Only persist tracking after the CSV write succeeds — if write fails
+    # we'd rather re-process next run than lose records.
+    save_tracking(tracking, config.LOCAL_TRACKING_FILE)
+    logging.info("Sheriff sales: %d new records written to %s", len(new_notices), csv_path)
+
+
+def _run_nj_somerset_sheriff(args) -> None:
+    """Scrape Somerset County NJ sheriff sales from somersetcountynj.gov.
+
+    Unlike the salesweb.civilview.com scraper, Somerset publishes sales as
+    PDF advertisements linked from a single HTML page. Scraper parses the
+    landing page for Sale# links, downloads each PDF, and extracts docket
+    number / plaintiff / defendants / property address / block-lot /
+    judgment amount via regex against the extracted text.
+    """
+    import asyncio
+    from datetime import datetime as _dt
+    from nj_somerset_sheriff import scrape_somerset_sheriff_sales
+    from notice_parser import NoticeData
+
+    include_bankruptcy = not getattr(args, "no_bankruptcy", False)
+    max_records = getattr(args, "max_records", None) or 0
+    headless = not getattr(args, "visible", False)
+
+    records = asyncio.run(scrape_somerset_sheriff_sales(
+        include_bankruptcy=include_bankruptcy,
+        max_records=max_records,
+        headless=headless,
+    ))
+    if not records:
+        logging.warning("No Somerset sheriff sales parsed — check site availability")
+        return
+
+    notices = []
+    for r in records:
+        # Convert MM/DD/YY sale date → YYYY-MM-DD; skip "00/00/00" bankruptcy holds
+        auction_iso = ""
+        raw_date = r.get("sale_date", "")
+        if raw_date and raw_date != "00/00/00":
+            try:
+                auction_iso = _dt.strptime(raw_date, "%m/%d/%y").strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+
+        raw_bits: list[str] = []
+        if r.get("sale_number"): raw_bits.append(f"Sale#: {r['sale_number']}")
+        if r.get("docket_number"): raw_bits.append(f"Docket: {r['docket_number']}")
+        if r.get("plaintiff"): raw_bits.append(f"Plaintiff: {r['plaintiff']}")
+        if r.get("judgment_amount"): raw_bits.append(f"Judgment: ${r['judgment_amount']}")
+        if r.get("upset_bid"): raw_bits.append(f"Upset: ${r['upset_bid']}")
+        if r.get("block") and r.get("lot"):
+            raw_bits.append(f"Block-Lot: {r['block']}-{r['lot']}")
+        if r.get("nearest_cross_street"):
+            raw_bits.append(f"Cross St: {r['nearest_cross_street']}")
+        if r.get("owner_occupied"): raw_bits.append("Owner Occupied")
+        if r.get("status"): raw_bits.append(f"Status: {r['status']}")
+
+        notices.append(NoticeData(
+            date_added=_dt.now().strftime("%Y-%m-%d"),
+            auction_date=auction_iso,
+            address=r.get("property_address", ""),
+            city=r.get("city", ""),
+            state=r.get("state", "NJ"),
+            zip=r.get("zip_code", ""),
+            owner_name=r.get("defendants", ""),
+            notice_type="sheriff_sale",
+            county="Somerset",
+            source_url=r.get("pdf_url", ""),
+            raw_text=" | ".join(raw_bits),
+        ))
+
+    from data_formatter import deduplicate, write_csv
+    notices = deduplicate(notices)
+    csv_path = write_csv(notices)
+    logging.info("Somerset sheriff sales: %d records written to %s", len(notices), csv_path)
+
+
+def _run_nj_scrape(args) -> None:
+    """Run NJ Lis Pendens auto-scrape: login → download → enrich → upload → Slack."""
+    import asyncio
+
+    counties = getattr(args, "nj_counties", None)
+    if counties:
+        counties = [c.strip() for c in counties.split(",")]
+
+    do_upload = getattr(args, "upload_datasift", False)
+    do_slack = getattr(args, "notify_slack", False)
+    headless = not getattr(args, "headed", False)
+
+    result = asyncio.run(
+        __import__("nj_scraper").run_nj_scrape(
+            counties=counties,
+            headless=headless,
+            upload_datasift=do_upload,
+            notify_slack=do_slack,
+        )
+    )
+
+    if result.get("success"):
+        logging.info("NJ scrape complete: %s", result.get("message"))
+        if result.get("output_csv"):
+            logging.info("Output: %s", result["output_csv"])
+    else:
+        logging.error("NJ scrape failed: %s", result.get("message"))
+        sys.exit(1)
+
+
+def _run_nj_probate(args) -> None:
+    """Scrape Middlesex County NJ surrogate probate filings (Bluestone portal).
+
+    Iterates day-by-day through --days-back Death Dates (default 30) and
+    grabs each case's detail page for executor name + decedent mailing address.
+    """
+    import asyncio
+
+    days_back = getattr(args, "days_back", None) or 30
+    headless = not getattr(args, "headed", False)
+    do_upload = getattr(args, "upload_datasift", False)
+    do_slack = getattr(args, "notify_slack", False)
+
+    result = asyncio.run(
+        __import__("nj_middlesex_probate").run_middlesex_probate_scrape(
+            days_back=days_back,
+            headless=headless,
+            upload_datasift=do_upload,
+            notify_slack=do_slack,
+        )
+    )
+
+    if result.get("success"):
+        logging.info("NJ probate scrape complete: %s", result.get("message"))
+        if result.get("output_csv"):
+            logging.info("Output: %s", result["output_csv"])
+    else:
+        logging.error("NJ probate scrape failed: %s", result.get("message"))
+        sys.exit(1)
 
 
 def _run_phone_validate(args) -> None:
@@ -1127,16 +1293,17 @@ def cli_main() -> None:
     parser.add_argument(
         "mode",
         choices=[
-            "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
-            "csv-import", "phone-validate", "manage-sold", "manage-presets",
+            "pdf-import", "photo-import", "dropbox-watch",
+            "csv-import", "nj-scrape", "nj-sheriff", "nj-somerset-sheriff", "nj-probate", "phone-validate", "manage-sold", "manage-presets",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
             "playbook",
         ],
         help=(
-            "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
+            "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
+            "nj-scrape/nj-sheriff/nj-somerset-sheriff/nj-probate = NJ data sources; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
@@ -1271,6 +1438,12 @@ def cli_main() -> None:
         default=None,
         help='County name for CSV import, e.g. "Knox" (sets county for records missing it)',
     )
+    parser.add_argument(
+        "--notice-type",
+        type=str,
+        default=None,
+        help='Default notice type for CSV import records missing it, e.g. "foreclosure"',
+    )
 
     parser.add_argument(
         "--skip-smarty",
@@ -1381,6 +1554,43 @@ def cli_main() -> None:
         action="store_true",
         help="Send run summary to Slack/Discord webhook (requires SLACK_WEBHOOK_URL)",
     )
+    # NJ Lis Pendens arguments
+    parser.add_argument(
+        "--nj-counties",
+        type=str,
+        default=None,
+        help='Comma-separated NJ counties for nj-scrape (default: Essex,Middlesex,Somerset,Union)',
+    )
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Run browser in headed (visible) mode for nj-scrape debugging",
+    )
+    parser.add_argument(
+        "--days-back",
+        type=int,
+        default=None,
+        help="Lookback window in days for nj-probate (default: 30)",
+    )
+
+    # Somerset sheriff-sale arguments (PDF-based scraper)
+    parser.add_argument(
+        "--no-bankruptcy",
+        action="store_true",
+        help="Exclude bankruptcy-hold sales from nj-somerset-sheriff output",
+    )
+    parser.add_argument(
+        "--max-records",
+        type=int,
+        default=None,
+        help="Cap on records to scrape for nj-somerset-sheriff (0/None = all)",
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        help="Run browser in visible (headed) mode for nj-somerset-sheriff debugging",
+    )
+
     parser.add_argument(
         "--audit-records",
         action="store_true",
@@ -1392,7 +1602,7 @@ def cli_main() -> None:
         "--list-name",
         type=str,
         default=None,
-        help="DataSift list name to export phones from (phone-validate mode)",
+        help="DataSift list name: used as upload list name in csv-import mode (default: derived from CSV filename), or list to export phones from in phone-validate mode",
     )
     parser.add_argument(
         "--preset-folder",
@@ -1800,36 +2010,31 @@ def cli_main() -> None:
         _run_csv_import(args)
         return
 
-    # Filter saved searches
-    counties = None
-    if args.counties and args.counties.lower() != "all":
-        counties = [c.strip() for c in args.counties.split(",")]
+    # NJ Lis Pendens auto-scrape
+    if args.mode == "nj-scrape":
+        _run_nj_scrape(args)
+        return
 
-    types = None
-    if args.types and args.types.lower() != "all":
-        types = [t.strip() for t in args.types.split(",")]
+    # NJ Sheriff sales scrape (salesweb.civilview.com)
+    if args.mode == "nj-sheriff":
+        _run_nj_sheriff(args)
+        return
 
-    searches = _filter_searches(counties, types)
-    if not searches:
-        logging.error("No saved searches match the given --counties / --types filters")
-        sys.exit(1)
+    # Somerset NJ sheriff sales scrape (somersetcountynj.gov, PDF-based)
+    if args.mode == "nj-somerset-sheriff":
+        _run_nj_somerset_sheriff(args)
+        return
 
-    logging.info(
-        "Running %d saved searches: %s",
-        len(searches),
-        ", ".join(s.saved_search_name for s in searches),
-    )
+    # Middlesex NJ surrogate probate scrape (Bluestone portal)
+    if args.mode == "nj-probate":
+        _run_nj_probate(args)
+        return
 
-    try:
-        _run_scrape_pipeline(args, searches)
-    except Exception as e:
-        logging.exception("Pipeline failed with unhandled error")
-        try:
-            from slack_notifier import notify_error
-            notify_error("Pipeline (top-level)", e, context=f"mode={args.mode}")
-        except Exception:
-            pass
-        sys.exit(1)
+    # All other modes (comp/rehab/deal-analyzer/etc.) return via their
+    # own early-return branches earlier in this function. Reaching here
+    # means the mode wasn't dispatched — fall through and exit cleanly.
+    logging.error("Mode %r not wired into cli_main", args.mode)
+    sys.exit(1)
 
 
 def _run_scrape_pipeline(args, searches) -> None:

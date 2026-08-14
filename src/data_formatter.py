@@ -99,6 +99,43 @@ SIFT_COLUMNS = [
     "notice_screenshot_url",
     # Pipeline metadata
     "run_id",
+    # CivilView sheriff-sale detail-page enrichment (set by
+    # nj_sheriff_detail.enrich_sheriff_records). Somerset PDF records
+    # bypass the enricher — their detail fields stay blank.
+    "court_case_number",
+    "approx_judgment",
+    "minimum_bid",
+    "plaintiff_attorney",
+    "plaintiff_attorney_phone",
+    "parcel_number",
+    "property_note",
+    "current_status",
+    "adjournment_count",
+    "first_scheduled_date",
+    "days_since_first_scheduled",
+    "case_disposition",
+    "is_open",
+    "status_history_json",
+    # Sheriff-sale priority tiering (set by nj_sheriff_sales.apply_priority_tiers
+    # after detail enrichment runs). Somerset records get UNKNOWN tier
+    # because they skip the CivilView detail page.
+    "adjournments_remaining",
+    "days_until_auction",
+    "priority_tier",
+    # Niche cohort tag — "Niche Week NN YYYY" for probate records that
+    # clear all three gates (equity >40%, single family, out-of-state P
+    # heir). Set by niche_cohort.tag_niche_leads after enrichment.
+    "niche",
+    # Ownership verification — decedent vs MOD-IV owner of record for probate
+    # runner records. "verified"/"mismatch"/"unknown". Flag only, never drops.
+    # Set by ownership_verifier.enrich_ownership during enrichment.
+    "ownership_status",
+    # Court docket date — set by scrapers that expose a real filing date on
+    # the source page (Middlesex probate "Date Filed"). Distinct from
+    # date_added (scrape timestamp) so downstream can compute "days since
+    # filing" from the actual court date. Empty for sources without a
+    # filing-date field (sheriff sales, TN photo import).
+    "date_filed",
 ]
 
 
@@ -299,6 +336,26 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "source_url": notice.source_url,
                 "notice_screenshot_url": getattr(notice, "notice_screenshot_url", ""),
                 "run_id": notice.run_id,
+                "court_case_number": notice.court_case_number,
+                "approx_judgment": notice.approx_judgment,
+                "minimum_bid": notice.minimum_bid,
+                "plaintiff_attorney": notice.plaintiff_attorney,
+                "plaintiff_attorney_phone": notice.plaintiff_attorney_phone,
+                "parcel_number": notice.parcel_number,
+                "property_note": notice.property_note,
+                "current_status": notice.current_status,
+                "adjournment_count": notice.adjournment_count,
+                "first_scheduled_date": _format_date_sift(notice.first_scheduled_date),
+                "days_since_first_scheduled": notice.days_since_first_scheduled,
+                "case_disposition": notice.case_disposition,
+                "is_open": notice.is_open,
+                "status_history_json": notice.status_history_json,
+                "adjournments_remaining": notice.adjournments_remaining,
+                "days_until_auction": notice.days_until_auction,
+                "priority_tier": notice.priority_tier,
+                "niche": notice.niche,
+                "ownership_status": notice.ownership_status,
+                "date_filed": _format_date_sift(notice.date_filed),
             }
             writer.writerow(row)
             written += 1
@@ -329,11 +386,51 @@ def write_csv_by_type(notices: list[NoticeData]) -> list[Path]:
     return paths
 
 
+def write_csv_by_list(
+    notices: list[NoticeData],
+    prefix: str = "",
+) -> list[tuple[str, Path, int]]:
+    """Write one CSV per DataSift list (grouped by NOTICE_TYPE_TO_CATEGORY).
+
+    Records with the same DataSift list name are co-located (e.g. Somerset
+    sheriff_sale + CivilView sheriff_sale both land in the "Sheriff Sale"
+    CSV since they both map to the same list). Records whose notice_type
+    isn't in the map go into an "Unmapped" bucket.
+
+    Args:
+        notices: enriched NoticeData records.
+        prefix: optional filename prefix (e.g. "held" for paused-type runs).
+
+    Returns:
+        List of (list_name, csv_path, record_count) tuples, sorted by list_name.
+    """
+    from datasift_formatter import NOTICE_TYPE_TO_CATEGORY
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    groups: dict[str, list[NoticeData]] = {}
+    for n in notices:
+        nt = (n.notice_type or "").lower()
+        list_name = NOTICE_TYPE_TO_CATEGORY.get(nt, "Unmapped")
+        groups.setdefault(list_name, []).append(n)
+
+    results: list[tuple[str, Path, int]] = []
+    for list_name, group in sorted(groups.items()):
+        # Slugify the list name for the filename — drop parens, replace
+        # spaces + special chars with underscores.
+        slug = re.sub(r"[^A-Za-z0-9]+", "_", list_name).strip("_")
+        stem = f"{prefix}_{slug}" if prefix else slug
+        filename = f"{stem}_{timestamp}.csv"
+        path = write_csv(group, filename)
+        results.append((list_name, path, len(group)))
+    return results
+
+
 # ── CSV Re-Import ────────────────────────────────────────────────────────────
 
 # CSV column → NoticeData field name (where Sift columns differ from field names)
 CSV_TO_FIELD = {
     "full_name": "owner_name",
+    "name": "owner_name",
     "Date Added": "date_added",
     "Notice Publish Date": "date_published",
     "Owner Street": "owner_street",
@@ -346,7 +443,7 @@ CSV_TO_FIELD = {
 _NOTICE_FIELDS = {f.name for f in NoticeData.__dataclass_fields__.values()}
 
 # Date columns that use Sift M/D/YYYY format and need conversion back to YYYY-MM-DD
-_DATE_FIELDS = {"date_added", "date_published", "auction_date", "mls_last_sold_date"}
+_DATE_FIELDS = {"date_added", "date_published", "auction_date", "mls_last_sold_date", "date_filed"}
 
 
 def _parse_sift_date(sift_date: str) -> str:
@@ -391,7 +488,7 @@ def read_csv(path: str | Path) -> list[NoticeData]:
         for row in reader:
             mapped: dict[str, str] = {}
             for csv_col, raw_value in row.items():
-                field = CSV_TO_FIELD.get(csv_col, csv_col)
+                field = CSV_TO_FIELD.get(csv_col) or CSV_TO_FIELD.get(csv_col.lower()) or csv_col.lower()
                 if field in _NOTICE_FIELDS:
                     val: str = raw_value if raw_value is not None else ""
                     if field in _DATE_FIELDS:

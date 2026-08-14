@@ -3,6 +3,10 @@
 input.json
 input_foreclosure_daily.json
 
+# Runner XLSX staging directory (weekly probate intake — never commit
+# runner-supplied PII to git).
+input/
+
 # State files (generated at runtime)
 last_run.json
 seen_ids.json
@@ -12,14 +16,25 @@ cookies.json
 datasift_cookies.json
 dropbox_state.json
 photo_state.json
+nj_lp_cookies.json
+newark_cv_cookies.json
+tracking/
 smrtphone_state.json
 *_state.json
 *.tmp
 *.bak
 
+# Dev screenshots (DataSift UI captures from local debugging)
+datasift_*.png
+
+# Working files (local drafts & weekly NOD lists)
+NOD Week*
+
 # Output (generated data)
 output/
 logs/
+deep_prospecting/outputs/
+deep_prospecting/inputs/
 
 # Python
 __pycache__/

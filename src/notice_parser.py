@@ -37,7 +37,7 @@ class NoticeData:
     auction_date: str = ""     # Scheduled sale/auction date (YYYY-MM-DD)
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = "NJ"
     zip: str = ""
     owner_name: str = ""
     notice_type: str = ""      # foreclosure | tax_sale | tax_lien | probate
@@ -51,6 +51,40 @@ class NoticeData:
     dpv_match_code: str = ""   # Delivery Point Validation: Y=confirmed, S=secondary missing, N=no match
     vacant: str = ""           # "Y" if address is vacant
     rdi: str = ""              # "Residential" or "Commercial"
+    # Block/lot fallback — addresses that aren't a real street address
+    # (e.g. tax sale notices referencing "Block 14 Lot 7"). Flagged
+    # records skip Smarty + the vacant-land filter and survive to the
+    # held CSVs with the original block/lot text preserved for manual
+    # downstream lookup.
+    needs_manual_address: str = ""  # "yes" when address requires manual resolution
+    address_raw: str = ""           # Original pre-flag address (preserved when flagged)
+    # CivilView sheriff-sale detail-page enrichment (populated post-scrape
+    # by nj_sheriff_detail.enrich_sheriff_records). Somerset PDF-based
+    # sales bypass the enricher — their detail fields stay blank.
+    court_case_number: str = ""        # e.g. "F00566323"
+    approx_judgment: str = ""          # numeric str, $ + commas stripped
+    minimum_bid: str = ""              # numeric str, $ + commas stripped (often blank)
+    plaintiff_attorney: str = ""
+    plaintiff_attorney_phone: str = ""
+    parcel_number: str = ""            # "LOT 9 BLOCK 589" from CivilView
+    property_note: str = ""            # often blank
+    current_status: str = ""           # most recent Status History entry
+    adjournment_count: str = ""        # int as str — # of "Adjourned" history entries
+    first_scheduled_date: str = ""     # YYYY-MM-DD — earliest date in status history
+    days_since_first_scheduled: str = ""  # int as str — today minus first_scheduled_date
+    case_disposition: str = ""         # Open / Sold / Redeemed / Bankruptcy / Cancelled
+    is_open: str = ""                  # "yes" if current_status starts with Scheduled
+    status_history_json: str = ""      # JSON array of {"status","date"} objects
+    # Sheriff-sale priority tiering (derived post-enrichment in
+    # nj_sheriff_sales.apply_priority_tiers — runs after detail enrichment).
+    # Somerset records skip detail enrichment, so they tier as UNKNOWN.
+    adjournments_remaining: str = ""   # int as str — max(0, 2 - adjournment_count); "" if unknown
+    days_until_auction: str = ""       # int as str — auction_date minus today; "" if unknown
+    priority_tier: str = ""            # HOT / WARM / URGENT_NO_OPTIONS / LONG_RUNWAY / PAST_DUE / UNKNOWN
+    # Niche cohort tag (set post-enrichment by niche_cohort.tag_niche_leads):
+    # "Niche Week NN YYYY" when a probate record clears all three gates
+    # (equity >40%, single family, out-of-state P heir); "" otherwise.
+    niche: str = ""
     # Zillow property enrichment fields (populated post-scrape)
     mls_status: str = ""           # "Active", "Pending", "Sold", "Off Market"
     mls_listing_price: str = ""    # Current list price or last sold price
@@ -78,10 +112,20 @@ class NoticeData:
     # Deceased owner detection
     deceased_indicator: str = ""       # "life_estate", "personal_rep", "trustee", "care_of", "et_al", or ""
     tax_owner_name: str = ""           # Raw owner name from county tax API
+    ownership_status: str = ""         # "verified"/"mismatch"/"unknown" — decedent vs owner of record (probate)
     # Obituary-confirmed deceased owner
     owner_deceased: str = ""                # "yes" or "" — confirmed via obituary search
     date_of_death: str = ""                 # YYYY-MM-DD from obituary
+    # Court docket date — distinct from date_added (scrape timestamp). Set by
+    # scrapers that expose a real filing/case-open date on the source page
+    # (e.g. Middlesex probate "Date Filed"). Enables grief-tier math from the
+    # actual filing date rather than "days since we scraped it".
+    date_filed: str = ""                    # YYYY-MM-DD — court filing/docket date
     obituary_url: str = ""                  # URL of confirmed obituary
+    age_at_death: str = ""                  # Integer age at death extracted from obit
+    obituary_snippet: str = ""              # First ~500 chars of fetched obit text (for Notes)
+    obit_survivors_json: str = ""           # JSON array of all named survivors from obit
+    preceded_in_death: str = ""             # Comma-separated names who predeceased (from obit)
     decision_maker_name: str = ""           # Heir/executor full name
     decision_maker_relationship: str = ""   # "spouse", "son", "daughter", "executor", etc.
     # Deep prospecting — ranked decision-makers (flat columns)

@@ -7,6 +7,7 @@ the decision-maker (heir/executor) for each deceased owner.
 This catches deceased owners the county tax API hasn't flagged yet.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -29,12 +30,73 @@ from notice_parser import NoticeData
 logger = logging.getLogger(__name__)
 
 MAX_TOKENS = 1024
-SEARCH_DELAY_MIN = 0.5
-SEARCH_DELAY_MAX = 1.0
-PARALLEL_WORKERS = 6  # Concurrent heir verifications
+SEARCH_DELAY_MIN = 2.0
+SEARCH_DELAY_MAX = 4.0
+PARALLEL_WORKERS = 3  # Concurrent heir verifications (was 6 — reduced to dial back search burstiness)
+
+# ── Brave Search rate-limit guards ────────────────────────────────────
+# Brave throttled aggressively after ~50 records under the old config,
+# wiping obituary search quality on later notices in a batch. The
+# semaphore + last-call lock serialize Brave calls across all worker
+# threads with a minimum 2s gap; the retry helper handles transient 429s
+# with exponential backoff. Applies to the Brave-only fallback DDGS call
+# in `_search_obituary` — DDG-primary calls bypass these guards.
+_brave_semaphore = threading.Semaphore(1)
+_brave_lock = threading.Lock()
+_brave_last_call: float = 0.0
+MIN_BRAVE_GAP_SECONDS = 2.0
+BRAVE_RETRY_WAITS = (10.0, 20.0, 40.0)  # Exponential backoff: 10s, 20s, 40s
+
 FETCH_TIMEOUT = 20
 MAX_OBITUARY_TEXT = 6000
 MAX_ADDRESS_TEXT = 15000  # Larger limit for people search pages (CBC has 250+ results)
+
+
+def _brave_search_with_retry(query: str, max_results: int = 8) -> list[dict]:
+    """DDGS Brave-only search with semaphore, min-gap, and 429 retry.
+
+    Returns the raw DDGS result list (may be empty). Never raises —
+    exhausted retries log at WARNING and return [].
+    """
+    with _brave_semaphore:
+        # Enforce minimum gap since the last Brave call across all
+        # workers. Holding the lock briefly is fine; the sleep happens
+        # outside the lock so other workers can queue at the semaphore.
+        with _brave_lock:
+            global _brave_last_call
+            wait_for_gap = MIN_BRAVE_GAP_SECONDS - (time.time() - _brave_last_call)
+        if wait_for_gap > 0:
+            time.sleep(wait_for_gap)
+
+        for attempt, wait_base in enumerate(BRAVE_RETRY_WAITS, start=1):
+            try:
+                results = DDGS().text(query, max_results=max_results, backend="brave")
+                with _brave_lock:
+                    _brave_last_call = time.time()
+                return list(results)
+            except Exception as e:
+                msg = str(e)
+                is_rate_limited = "429" in msg or "rate" in msg.lower() or "ratelimit" in msg.lower()
+                if not is_rate_limited:
+                    logger.debug("Brave search non-429 error for '%s': %s", query, e)
+                    with _brave_lock:
+                        _brave_last_call = time.time()
+                    return []
+                if attempt >= len(BRAVE_RETRY_WAITS):
+                    logger.warning(
+                        "Brave 429 rate limited, retries exhausted for '%s' — returning empty",
+                        query,
+                    )
+                    with _brave_lock:
+                        _brave_last_call = time.time()
+                    return []
+                wait = wait_base + random.uniform(0.0, 3.0)
+                logger.warning(
+                    "Brave 429 rate limited, retry %d/%d after %.1fs",
+                    attempt, len(BRAVE_RETRY_WAITS), wait,
+                )
+                time.sleep(wait)
+        return []
 
 # Maximum years between DOD and notice filing date to accept an obituary match.
 # Probate is typically filed within 1-2 years of death. 3 years gives margin.
@@ -320,12 +382,12 @@ OBITUARY_PROMPT = """\
 I have a property record with this owner information:
 - Owner name: {owner_name}
 - Property city: {city}
-- Property state: Tennessee
+- Property state: {state}
 - Property address: {address}
 
 Below is text from a potential obituary. Determine if this obituary is for the same person \
 as the property owner. Consider: name match (first + last name must match; middle name/initial \
-is bonus confirmation), location match (same city or county in Tennessee), and timeline \
+is bonus confirmation), location match (same city or county in {state}), and timeline \
 plausibility (death within last 5 years is typical for active foreclosure/tax sale records).
 
 Return a JSON object with these exact keys:
@@ -505,53 +567,137 @@ def _is_obituary_url(url: str) -> bool:
     return False
 
 
-def _search_obituary(name: str, city: str, extra_terms: str = "") -> list[dict]:
-    """Search DuckDuckGo for obituary pages matching the person.
+_STATE_NAMES: dict[str, str] = {
+    "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
+    "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
+    "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+    "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas",
+    "KY": "Kentucky", "LA": "Louisiana", "ME": "Maine", "MD": "Maryland",
+    "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota", "MS": "Mississippi",
+    "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+    "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York",
+    "NC": "North Carolina", "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma",
+    "OR": "Oregon", "PA": "Pennsylvania", "RI": "Rhode Island", "SC": "South Carolina",
+    "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas", "UT": "Utah",
+    "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+    "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia",
+}
+
+
+def _state_name(code: str) -> str:
+    """Convert 2-letter state code to full name (e.g. 'NJ' → 'New Jersey')."""
+    return _STATE_NAMES.get(code.upper().strip(), "Tennessee")
+
+
+def _serper_obituary_search(query: str, num: int = 8) -> list[dict]:
+    """Serper.dev Google search for obituary pages, returned in DDGS shape.
+
+    Replaces the Brave fallback in obituary search: Brave rate-limits Modal's
+    shared egress IPs (HTTP 429 after ~3-4 calls), which tanked decision-maker
+    identification (41.8% vs 70% floor on the 2026-06-24 run). Serper is
+    key-based — no IP throttling — and is already used for the DM address
+    waterfall. Returns [] if SERPER_API_KEY is unset (caller still has DDG).
+
+    Output dicts use DDGS keys (href/title/body) so _collect_obit_results
+    can consume Serper and DDG results interchangeably.
+    """
+    import config as cfg
+    if not cfg.SERPER_API_KEY:
+        return []
+    try:
+        resp = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": cfg.SERPER_API_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"q": query, "num": num},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.debug("Serper obituary search failed for '%s': %s", query, e)
+        return []
+    return [
+        {
+            "href": item.get("link", ""),
+            "title": item.get("title", ""),
+            "body": item.get("snippet", ""),
+        }
+        for item in data.get("organic", [])
+    ]
+
+
+def _search_obituary(name: str, city: str, extra_terms: str = "", state: str = "Tennessee") -> list[dict]:
+    """Search DuckDuckGo first, Serper (Google) as fallback, for obituary pages.
+
+    Two-stage search: try DDG-only; only escalate to Serper if DDG returned
+    zero obituary-domain hits. Serper replaced the old Brave fallback, which
+    429'd on Modal's shared egress IPs and tanked DM identification.
 
     Args:
         name: Person's full name.
         city: City for geo-filtering (empty string to omit).
         extra_terms: Additional search terms to replace "obituary" keyword
                      (e.g. '"death notice" OR "funeral"').
+        state: Full state name for geo-filtering (e.g. "New Jersey").
 
     Returns list of {url, title, snippet} for obituary-domain results.
     """
     keyword = extra_terms if extra_terms else "obituary"
-    query = f'{name} {keyword} Tennessee' if not city else f'{name} {keyword} {city} Tennessee'
+    query = f'{name} {keyword} {state}' if not city else f'{name} {keyword} {city} {state}'
 
+    # Stage 1: DDG-only primary.
     try:
-        results = DDGS().text(query, max_results=8, backend="google,duckduckgo,brave")
+        ddg_results = list(DDGS().text(query, max_results=8, backend="duckduckgo"))
     except Exception as e:
-        logger.debug("Search failed for '%s': %s", query, e)
-        return []
+        logger.debug("DDG search failed for '%s': %s", query, e)
+        ddg_results = []
 
-    obituary_results = []
-    for r in results:
-        url = r.get("href", "")
-        if _is_obituary_url(url):
-            obituary_results.append({
-                "url": url,
-                "title": r.get("title", ""),
-                "snippet": r.get("body", ""),
-            })
+    def _collect_obit_results(raw: list[dict]) -> list[dict]:
+        collected: list[dict] = []
+        for r in raw:
+            url = r.get("href", "")
+            if _is_obituary_url(url):
+                collected.append({
+                    "url": url,
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", ""),
+                })
+        # Also include non-obituary-domain results that mention obit
+        # signal words in the title/snippet.
+        for r in raw:
+            url = r.get("href", "")
+            if url in [o["url"] for o in collected]:
+                continue
+            title = r.get("title", "").lower()
+            snippet = r.get("body", "").lower()
+            if ("obituary" in title or "obituary" in snippet or "passed away" in snippet
+                    or "death notice" in title or "death notice" in snippet
+                    or "funeral" in title or "funeral" in snippet):
+                collected.append({
+                    "url": url,
+                    "title": r.get("title", ""),
+                    "snippet": r.get("body", ""),
+                })
+        return collected
 
-    # Also include non-obituary-domain results that mention "obituary" in title/snippet
-    for r in results:
-        url = r.get("href", "")
-        if url in [o["url"] for o in obituary_results]:
-            continue
-        title = r.get("title", "").lower()
-        snippet = r.get("body", "").lower()
-        if ("obituary" in title or "obituary" in snippet or "passed away" in snippet
-                or "death notice" in title or "death notice" in snippet
-                or "funeral" in title or "funeral" in snippet):
-            obituary_results.append({
-                "url": url,
-                "title": r.get("title", ""),
-                "snippet": r.get("body", ""),
-            })
+    obituary_results = _collect_obit_results(ddg_results)
+    ddg_obit_domain_count = sum(1 for r in ddg_results if _is_obituary_url(r.get("href", "")))
 
-    return obituary_results[:8]  # Process all DDG results (was 5, raised for coverage)
+    # Stage 2: Serper (Google) fallback — only if DDG produced no obituary-
+    # domain hits. Replaced Brave, which 429s on Modal's shared egress IPs.
+    if ddg_obit_domain_count == 0:
+        serper_results = _serper_obituary_search(query, num=8)
+        if serper_results:
+            existing_urls = {o["url"] for o in obituary_results}
+            for extra in _collect_obit_results(serper_results):
+                if extra["url"] not in existing_urls:
+                    obituary_results.append(extra)
+                    existing_urls.add(extra["url"])
+
+    return obituary_results[:8]  # Process all results (DDG + optional Serper fallback)
 
 
 def _extract_structured_text(html: str, url: str) -> str:
@@ -673,6 +819,7 @@ def _refetch_specific_obituary(
     original_url: str,
     api_key: str,
     address: str = "",
+    state: str = "Tennessee",
 ) -> tuple[dict | None, str, str]:
     """Re-search for a specific obituary page when original match was a listing page.
 
@@ -680,7 +827,7 @@ def _refetch_specific_obituary(
     """
     queries = [
         f'"{name}" obituary site:legacy.com',
-        f'"{name}" obituary {city} Tennessee "survived by"',
+        f'"{name}" obituary {city} {state} "survived by"',
     ]
 
     for query in queries:
@@ -708,6 +855,7 @@ def _refetch_specific_obituary(
                 city=city,
                 address=address,
                 api_key=api_key,
+                state=state,
             )
             if parsed and parsed.get("confidence") in ("high", "medium"):
                 logger.info("  Re-search found specific obituary: %s", url)
@@ -762,16 +910,17 @@ def _search_survivors_targeted(
     name: str,
     city: str,
     api_key: str,
+    state: str = "Tennessee",
 ) -> list[dict]:
     """Run targeted searches for survivor names when standard snippet lacks them.
 
     Returns list of survivor dicts [{name, relationship}] or empty list.
     """
     queries = [
-        f'"{name}" "survived by" {city} Tennessee',
-        f'"{name}" "preceded in death" {city} Tennessee',
+        f'"{name}" "survived by" {city} {state}',
+        f'"{name}" "preceded in death" {city} {state}',
         f'"{name}" obituary wife OR husband OR son OR daughter {city}',
-        f'"{name}" funeral OR memorial service {city} Tennessee',
+        f'"{name}" funeral OR memorial service {city} {state}',
     ]
 
     all_snippets = []
@@ -890,15 +1039,15 @@ ADDRESS_EXTRACT_PROMPT = """\
 Extract the current residential mailing address for this person from the web page text.
 
 Person: {name}
-Expected area: {city}, Tennessee (or nearby)
+Expected area: {city}, {state} (or nearby)
 
 Instructions:
 1. The page may list MULTIPLE people. Scan ALL result blocks to find the one that \
-best matches "{name}" in {city}, Tennessee.
+best matches "{name}" in {city}, {state}.
 2. Within that block, prefer the "Lives at" or "Current address" over "Used to live" addresses.
 3. If you find an exact name + state match, return it even if the city differs slightly \
-(people move within Tennessee).
-4. If multiple exact matches exist (common name), pick the Tennessee address closest \
+(people move within {state}).
+4. If multiple exact matches exist (common name), pick the {state} address closest \
 to {city}.
 5. If no confident match exists, return empty strings — do not guess.
 
@@ -948,7 +1097,7 @@ def _lookup_dm_address_knox_tax(name: str) -> dict | None:
         return None
 
 
-def _lookup_dm_address_web(name: str, city: str, api_key: str) -> dict | None:
+def _lookup_dm_address_web(name: str, city: str, api_key: str, state: str = "Tennessee") -> dict | None:
     """Search free people search sites for DM's residential address.
 
     Uses DuckDuckGo to find pages on people search sites, then Claude Haiku
@@ -957,8 +1106,8 @@ def _lookup_dm_address_web(name: str, city: str, api_key: str) -> dict | None:
     # Targeted people search query
     site_filter = " OR ".join(f"site:{d}" for d in list(PEOPLE_SEARCH_DOMAINS)[:4])
     queries = [
-        f'"{name}" {city} Tennessee {site_filter}',
-        f'"{name}" Tennessee address {city}',
+        f'"{name}" {city} {state} {site_filter}',
+        f'"{name}" {state} address {city}',
     ]
 
     for query in queries:
@@ -985,6 +1134,7 @@ def _lookup_dm_address_web(name: str, city: str, api_key: str) -> dict | None:
             prompt = ADDRESS_EXTRACT_PROMPT.format(
                 name=name,
                 city=city or "Knoxville",
+                state=state,
                 page_text=page_text[:MAX_OBITUARY_TEXT],
             )
             try:
@@ -1112,6 +1262,22 @@ _firecrawl_budget_total = int(os.environ.get("FIRECRAWL_BUDGET", "3000"))
 _firecrawl_calls_used = 0
 _firecrawl_lock = threading.Lock()
 
+# ── Week 26 Firecrawl cost controls ───────────────────────────────────
+# Hard per-run cap: once this many Firecrawl calls have been made in a run,
+# _fetch_firecrawl returns "" and callers use whatever data they already have.
+# Reset at the start of each enrich_obituary_data run. Binding constraint that
+# sits above the older soft percentage-based priority gating.
+_FIRECRAWL_MAX_CALLS_PER_RUN = int(os.environ.get("FIRECRAWL_MAX_CALLS", "100"))
+_firecrawl_cap_logged = False
+# Firecrawl for DM ADDRESS lookups is OFF by default: nj_taxrecords (Tier 1)
+# + Tracerfy already resolve NJ addresses without Firecrawl, and the people-
+# search address tier is fundamentally Firecrawl-dependent (CBC etc. 403
+# without JS render). Set FIRECRAWL_ADDRESS=1 to re-enable that tier.
+_FIRECRAWL_ADDRESS_ENABLED = os.environ.get("FIRECRAWL_ADDRESS", "0") == "1"
+# Cap heir verifications per record: no reason to verify 14 survivors when we
+# only need the top 1-2 decision-makers.
+_MAX_SURVIVORS_VERIFIED = int(os.environ.get("MAX_HEIRS_VERIFIED", "3"))
+
 
 def _fetch_firecrawl(
     url: str, wait_ms: int = 5000, max_text: int = 0, priority: str = "high"
@@ -1125,13 +1291,24 @@ def _fetch_firecrawl(
               allowed if >50% budget remains), "low" (DM address lookups, allowed
               if >75% budget remains).
     """
-    global _firecrawl_credits_exhausted, _firecrawl_calls_used
+    global _firecrawl_credits_exhausted, _firecrawl_calls_used, _firecrawl_cap_logged
     import config as cfg
     if not cfg.FIRECRAWL_API_KEY or _firecrawl_credits_exhausted:
         return ""
 
     # Budget-based priority gating (thread-safe read)
     with _firecrawl_lock:
+        # Hard per-run cap (cost control) — the binding constraint. Once hit,
+        # skip all further Firecrawl and let callers use available data.
+        if _firecrawl_calls_used >= _FIRECRAWL_MAX_CALLS_PER_RUN:
+            if not _firecrawl_cap_logged:
+                logger.warning(
+                    "Firecrawl per-run cap reached (%d calls) — skipping remaining "
+                    "Firecrawl fetches this run; callers use already-available data",
+                    _FIRECRAWL_MAX_CALLS_PER_RUN,
+                )
+                _firecrawl_cap_logged = True
+            return ""
         budget_remaining_pct = 1.0 - (_firecrawl_calls_used / max(_firecrawl_budget_total, 1))
         if priority == "medium" and budget_remaining_pct < 0.50:
             logger.debug("Firecrawl budget <50%% — skipping medium-priority fetch for %s", url)
@@ -1180,12 +1357,13 @@ def _fetch_firecrawl(
 
 
 def _extract_address_from_page(
-    page_text: str, name: str, city: str, api_key: str
+    page_text: str, name: str, city: str, api_key: str, state: str = "Tennessee"
 ) -> dict | None:
     """Use Claude Haiku to extract a mailing address from page text."""
     prompt = ADDRESS_EXTRACT_PROMPT.format(
         name=name,
         city=city or "Knoxville",
+        state=state,
         page_text=page_text[:MAX_ADDRESS_TEXT],
     )
     try:
@@ -1207,7 +1385,7 @@ def _extract_address_from_page(
 
 
 def _lookup_dm_address_serper_firecrawl(
-    name: str, city: str, api_key: str
+    name: str, city: str, api_key: str, state: str = "Tennessee"
 ) -> dict | None:
     """Look up DM address via direct people search URLs + Firecrawl rendering.
 
@@ -1216,6 +1394,17 @@ def _lookup_dm_address_serper_firecrawl(
     search for additional people search sites. Uses Claude Haiku to extract
     the address from rendered page content.
     """
+    # Cost control (Week 26): this tier is fundamentally Firecrawl-dependent
+    # (CyberBackgroundChecks etc. 403 without JS render). nj_taxrecords (Tier 1)
+    # + Tracerfy already resolve NJ addresses, so skip Firecrawl here by default
+    # — only the initial obituary page fetch should burn Firecrawl. Re-enable
+    # with FIRECRAWL_ADDRESS=1 (e.g. for TN, which has no nj_taxrecords tier).
+    if not _FIRECRAWL_ADDRESS_ENABLED:
+        logger.debug(
+            "Address Firecrawl tier disabled (cost control) — skipping for %s", name
+        )
+        return None
+
     # Phase 1: Direct people search URLs (no Google search needed)
     direct_urls = _build_people_search_urls(name, city)
     for url in direct_urls:
@@ -1225,7 +1414,7 @@ def _lookup_dm_address_serper_firecrawl(
         if not page_text or len(page_text) < 100:
             continue
 
-        result = _extract_address_from_page(page_text, name, city, api_key)
+        result = _extract_address_from_page(page_text, name, city, api_key, state=state)
         if result:
             logger.debug("Direct URL hit for %s: %s", name, url)
             return result
@@ -1244,7 +1433,7 @@ def _lookup_dm_address_serper_firecrawl(
         if not page_text or len(page_text) < 100:
             continue
 
-        result = _extract_address_from_page(page_text, name, city, api_key)
+        result = _extract_address_from_page(page_text, name, city, api_key, state=state)
         if result:
             logger.debug("Serper URL hit for %s: %s", name, url)
             return result
@@ -1453,11 +1642,19 @@ def _batch_tracerfy_lookup(notices: list) -> None:
 
 def _lookup_dm_address(
     name: str, city: str, api_key: str, tracerfy_tier1: bool = False,
+    state: str = "Tennessee",
+    county: str = "",
 ) -> dict:
     """Look up decision-maker's mailing address using tiered sources.
 
+    Routes by state — TN records hit the Knox Tax API tier; NJ records
+    hit the taxrecords-nj.com tier (Vital Communications, free, covers
+    Middlesex/Somerset/Union). Both then fall through to people-search
+    waterfall for nationwide coverage.
+
     Tier 0 (opt-in): Tracerfy skip tracing (paid, highest hit rate)
-    Tier 1: Knox County Tax API (free, fast, Knox only)
+    Tier 1 (TN):  Knox County Tax API (free, fast, Knox only)
+    Tier 1 (NJ):  taxrecords-nj.com county-wide owner-name search (free)
     Tier 2: Serper.dev + Firecrawl + LLM (cheap, national)
     Tier 2b: DuckDuckGo fallback (free, unreliable -- used when Serper not configured)
 
@@ -1468,12 +1665,19 @@ def _lookup_dm_address(
     if not name or not name.strip():
         return result
 
+    # Detect NJ vs TN routing — `state` arrives as either the 2-letter code
+    # or the full state name depending on caller. NJ-specific tiers only
+    # fire when we're confident the record is in NJ.
+    state_norm = (state or "").strip().lower()
+    is_nj = state_norm in ("nj", "new jersey")
+
     # Tier 0 (opt-in): Tracerfy as primary lookup
     if tracerfy_tier1:
         import config as cfg
         if cfg.TRACERFY_API_KEY:
             tf_result = _lookup_dm_address_tracerfy(
-                name, city or "Knoxville", address="", zip_code=""
+                name, city or ("Newark" if is_nj else "Knoxville"),
+                address="", zip_code="",
             )
             if tf_result and tf_result.get("street"):
                 result.update(tf_result)
@@ -1482,11 +1686,74 @@ def _lookup_dm_address(
                             result["street"], result["city"])
                 return result
 
-    # Tier 1: Knox County Tax API (free, fast)
+    # Tier 1 (NJ): taxrecords-nj.com — Vital Communications county-wide
+    # search via inf.cgi. Free, fast, covers Middlesex/Somerset/Union
+    # (Essex uses a different vendor and falls through cleanly).
+    if is_nj:
+        try:
+            from nj_taxrecords import (
+                lookup_by_owner_name as _nj_lookup_by_name,
+                parcel_to_address_dict as _nj_to_dict,
+                COUNTY_CODES as _NJ_COUNTY_CODES,
+            )
+            nj_county = (county or "").strip().title()
+            if nj_county and nj_county in _NJ_COUNTY_CODES:
+                # MOD-IV's owner column is "LAST, FIRST [MIDDLE]" format.
+                # Strategy: search by last name only (broad), then filter
+                # client-side by first-name token match — handles middle
+                # initials, hyphenated names, etc. without forcing the
+                # caller to know the exact format.
+                #
+                # Caller may pass either "First Last" (typical from
+                # obituary_enricher's identify_decision_maker) OR
+                # "Last, First" (typical from court records). Detect
+                # via comma presence.
+                if "," in name:
+                    # "Smith, Carol A" format
+                    before, _, after = name.partition(",")
+                    before_tokens = [t for t in before.split() if t and len(t) > 1]
+                    after_tokens = [t for t in after.split() if t and len(t) > 1]
+                    last_name = before_tokens[-1].upper() if before_tokens else ""
+                    first_name = after_tokens[0].upper() if after_tokens else ""
+                else:
+                    # "Carol Smith" format
+                    name_tokens = [t for t in name.split() if t and len(t) > 1]
+                    if not name_tokens:
+                        raise ValueError(f"empty name: {name!r}")
+                    last_name = name_tokens[-1].upper()
+                    first_name = name_tokens[0].upper() if len(name_tokens) > 1 else ""
+
+                if not last_name:
+                    raise ValueError(f"no last name extracted from: {name!r}")
+
+                parcels = _nj_lookup_by_name(last_name, nj_county, page_size=100)
+                # Score each candidate: first-name match wins
+                if first_name:
+                    matched = [
+                        p for p in parcels
+                        if first_name in (p.owner_name or "").upper()
+                    ]
+                    parcels = matched or parcels  # fall back to all if no first-name match
+
+                if parcels:
+                    addr = _nj_to_dict(parcels[0], source="nj_taxrecords")
+                    if addr.get("street"):
+                        result.update(addr)
+                        logger.info(
+                            "    Tier 1 (NJ MOD-IV): %s, %s, %s %s  [%s]",
+                            result["street"], result["city"],
+                            result["state"], result["zip"],
+                            parcels[0].owner_name,
+                        )
+                        return result
+        except Exception as e:
+            logger.debug("NJ taxrecords lookup failed: %s", e)
+
+    # Tier 1 (TN): Knox County Tax API (free, fast)
     knox_cities = {"knoxville", "powell", "corryton", "mascot", "halls",
                    "farragut", "karns", "gibbs", "fountain city"}
     dm_city = (city or "").lower().strip()
-    if not dm_city or dm_city in knox_cities:
+    if not is_nj and (not dm_city or dm_city in knox_cities):
         name_parts = name.split()
         if len(name_parts) >= 2:
             tax_name = f"{name_parts[-1]} {' '.join(name_parts[:-1])}"
@@ -1501,7 +1768,7 @@ def _lookup_dm_address(
     # Tier 2: Direct people search URLs + Firecrawl + LLM
     import config as cfg
     sf_result = _lookup_dm_address_serper_firecrawl(
-        name, city or "Knoxville", api_key
+        name, city or "Knoxville", api_key, state=state
     )
     if sf_result and sf_result.get("street"):
         result.update(sf_result)
@@ -1512,7 +1779,7 @@ def _lookup_dm_address(
 
     # Tier 2b: DuckDuckGo fallback (when Serper/Firecrawl not configured)
     if not cfg.SERPER_API_KEY and not cfg.FIRECRAWL_API_KEY:
-        web_result = _lookup_dm_address_web(name, city or "Knoxville", api_key)
+        web_result = _lookup_dm_address_web(name, city or "Knoxville", api_key, state=state)
         if web_result and web_result.get("street"):
             result.update(web_result)
             result["source"] = "ddg_people_search"
@@ -1609,6 +1876,7 @@ def _parse_obituary_with_llm(
     city: str,
     address: str,
     api_key: str,
+    state: str = "Tennessee",
 ) -> dict | None:
     """Use Claude Haiku to validate and parse an obituary.
 
@@ -1625,6 +1893,7 @@ def _parse_obituary_with_llm(
         owner_name=owner_name,
         city=city or "unknown",
         address=address or "unknown",
+        state=state,
         obituary_text=obituary_text[:MAX_OBITUARY_TEXT],
     )
 
@@ -1911,6 +2180,7 @@ def verify_heir_status(
     api_key: str,
     depth: int = 0,
     max_depth: int = 2,
+    state: str = "Tennessee",
 ) -> dict:
     """Search for an obituary for a single heir to verify alive/dead.
 
@@ -1927,8 +2197,8 @@ def verify_heir_status(
         "search_log": {"query": "", "result": "not_searched"},
     }
 
-    results = _search_obituary(heir_name, city)
-    result["search_log"]["query"] = f"{heir_name} obituary {city} Tennessee"
+    results = _search_obituary(heir_name, city, state=state)
+    result["search_log"]["query"] = f"{heir_name} obituary {city} {state}"
 
     if not results:
         # No search results at all — likely alive (no obituary exists online)
@@ -1948,6 +2218,7 @@ def verify_heir_status(
                 city=city,
                 address="",  # don't know heir's address
                 api_key=api_key,
+                state=state,
             )
             if parsed and parsed.get("confidence") in ("high", "medium"):
                 result["status"] = "deceased"
@@ -1975,6 +2246,7 @@ def verify_heir_status(
             city=city,
             address="",
             api_key=api_key,
+            state=state,
         )
         if parsed and parsed.get("confidence") == "high":
             result["status"] = "deceased"
@@ -1998,6 +2270,7 @@ def build_heir_map(
     api_key: str,
     raw_name: str = "",
     max_depth: int = 2,
+    state: str = "Tennessee",
 ) -> tuple[list[dict], dict]:
     """Build heir map with verification, return (ranked_dms, error_info).
 
@@ -2055,13 +2328,26 @@ def build_heir_map(
 
         to_verify.append((name, s))
 
+    # Cost control (Week 26): cap heir verifications per record. Verifying 10+
+    # survivors burns Serper/Firecrawl/Anthropic for no benefit — we only need
+    # the top 1-2 decision-makers. Obituaries list immediate family (spouse,
+    # children) first, so keep the first N and skip the rest.
+    if len(to_verify) > _MAX_SURVIVORS_VERIFIED:
+        skipped_n = len(to_verify) - _MAX_SURVIVORS_VERIFIED
+        to_verify = to_verify[:_MAX_SURVIVORS_VERIFIED]
+        error_info["missing_flags"].append(f"heir_verify_capped_{skipped_n}")
+        logger.info(
+            "  Heir verification capped at %d (skipped %d survivors) for cost control",
+            _MAX_SURVIVORS_VERIFIED, skipped_n,
+        )
+
     # Parallel depth-0 heir verification
     def _verify_depth0(args):
         vname, _ = args
         logger.info("    Verifying heir: %s", vname)
         return vname, verify_heir_status(
             heir_name=vname, city=city, api_key=api_key,
-            depth=0, max_depth=max_depth,
+            depth=0, max_depth=max_depth, state=state,
         )
 
     sub_heirs_to_check: list[tuple[str, list]] = []
@@ -2093,7 +2379,7 @@ def build_heir_map(
         logger.info("      Verifying sub-heir: %s", vname)
         return vname, _, verify_heir_status(
             heir_name=vname, city=city, api_key=api_key,
-            depth=1, max_depth=max_depth,
+            depth=1, max_depth=max_depth, state=state,
         )
 
     if sub_verify_tasks:
@@ -2149,6 +2435,35 @@ def _apply_obituary_match(
     notice.date_of_death = parsed.get("date_of_death", "")
     notice.obituary_url = url
     notice.obituary_source_type = source_type
+
+    # Age at death — LLM already extracts this as an int (0 = not found)
+    age = parsed.get("age_at_death")
+    if age and int(age) > 0:
+        notice.age_at_death = str(int(age))
+
+    # Obit snippet — Phase A stashes raw obit text on parsed["_raw_obituary_text"]
+    # before _apply runs. Keep first 500 chars, stripped and single-spaced, so
+    # Notes gets a readable excerpt without bloating the DataSift record.
+    raw_obit = parsed.get("_raw_obituary_text") or ""
+    if raw_obit:
+        compact = " ".join(raw_obit.split())[:500]
+        notice.obituary_snippet = compact
+
+    # Full survivors list (name, relationship, city) — stored as JSON so the
+    # formatter can render all named family members, not just the DM pick.
+    survivors = parsed.get("survivors") or []
+    if survivors:
+        try:
+            notice.obit_survivors_json = json.dumps(survivors, ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+
+    # Predeceased — flat comma-separated list so it slots into Notes easily.
+    predeceased = parsed.get("preceded_in_death") or []
+    if predeceased:
+        notice.preceded_in_death = ", ".join(
+            str(p) for p in predeceased if p
+        )
 
     if ranked_dms:
         # Deep prospecting: apply top 3 ranked decision-makers
@@ -2229,6 +2544,27 @@ def _apply_obituary_match(
         notice.missing_data_flags = "|".join(flags)
 
 
+def _run_coro_blocking(coro):
+    """Run an async coroutine to completion from sync code, whether or not an
+    event loop is already running in this thread.
+
+    On Modal, enrich_obituary_data runs synchronously inside nj_weekly_all's
+    event loop, so a bare asyncio.run() raises "cannot be called from a
+    running event loop" and the Ancestry fallback silently never executes
+    (it just logs a warning and returns 0 hits). When a loop is already
+    running we offload to a worker thread with its own fresh loop; from the
+    local CLI (no running loop) asyncio.run() works directly.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # no running loop (local CLI) — safe
+    # A loop is already running in this thread (Modal): run the coroutine to
+    # completion in a separate thread with its own event loop.
+    with ThreadPoolExecutor(max_workers=1) as _pool:
+        return _pool.submit(asyncio.run, coro).result()
+
+
 def enrich_obituary_data(
     notices: list[NoticeData],
     api_key: str,
@@ -2256,6 +2592,21 @@ def enrich_obituary_data(
     if not api_key:
         logger.warning("No Anthropic API key — skipping obituary enrichment")
         return
+
+    # Reset the per-run Firecrawl budget so the hard cap
+    # (_FIRECRAWL_MAX_CALLS_PER_RUN) applies to THIS run, not cumulatively
+    # across runs sharing a process (matters for local CLI; Modal is fresh).
+    global _firecrawl_calls_used, _firecrawl_credits_exhausted, _firecrawl_cap_logged
+    _firecrawl_calls_used = 0
+    _firecrawl_credits_exhausted = False
+    _firecrawl_cap_logged = False
+    logger.info(
+        "Firecrawl cost controls: max %d calls/run, address-tier Firecrawl %s, "
+        "heir verifications capped at %d",
+        _FIRECRAWL_MAX_CALLS_PER_RUN,
+        "ON" if _FIRECRAWL_ADDRESS_ENABLED else "OFF",
+        _MAX_SURVIVORS_VERIFIED,
+    )
 
     # Build candidate list: notices with owner names to search
     # Tuple: (notice, raw_name, is_tax_name)
@@ -2345,6 +2696,7 @@ def enrich_obituary_data(
             continue
 
         city = notice.city.strip() or "Knoxville"
+        state_name = _state_name(notice.state)
         found = False
 
         for search_name in search_names[:2]:  # Primary + secondary (joint owner)
@@ -2364,8 +2716,8 @@ def enrich_obituary_data(
                 break
 
             # Run primary + no-city searches and merge results (dedup by URL)
-            results = _search_obituary(search_name, city)
-            no_city_results = _search_obituary(search_name, "")
+            results = _search_obituary(search_name, city, state=state_name)
+            no_city_results = _search_obituary(search_name, "", state=state_name)
             seen_urls = {r["url"] for r in results}
             for r in no_city_results:
                 if r["url"] not in seen_urls:
@@ -2379,7 +2731,7 @@ def enrich_obituary_data(
                 parts = search_name.split()
                 if len(parts) == 3:
                     name_no_mi = f"{parts[0]} {parts[2]}"
-                    results = _search_obituary(name_no_mi, city)
+                    results = _search_obituary(name_no_mi, city, state=state_name)
                     if results:
                         logger.debug(
                             "  [%d/%d] %s: fallback query (no MI) found %d results",
@@ -2394,7 +2746,7 @@ def enrich_obituary_data(
                 if first and last:
                     for variant in _get_name_variants(first):
                         nick_name = f"{variant} {last}".title()
-                        results = _search_obituary(nick_name, city)
+                        results = _search_obituary(nick_name, city, state=state_name)
                         if results:
                             logger.debug(
                                 "  [%d/%d] %s: nickname fallback (%s) found %d results",
@@ -2407,6 +2759,7 @@ def enrich_obituary_data(
                 results = _search_obituary(
                     search_name, city,
                     extra_terms='"death notice" OR "funeral"',
+                    state=state_name,
                 )
                 if results:
                     logger.debug(
@@ -2438,6 +2791,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state_name,
                 )
 
                 if parsed and parsed.get("confidence") in ("high", "medium"):
@@ -2483,6 +2837,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state_name,
                 )
 
                 _conf = parsed.get("confidence", "") if parsed else ""
@@ -2593,7 +2948,7 @@ def enrich_obituary_data(
                         city = notice.city.strip() or "Knoxville"
 
                         result = await ancestry_enricher.lookup_deceased(
-                            page, name=search_name, city=city, state="TN"
+                            page, name=search_name, city=city, state=notice.state or "TN"
                         )
                         if result and result.get("confirmed_deceased"):
                             notice.owner_deceased = "yes"
@@ -2613,20 +2968,24 @@ def enrich_obituary_data(
                 return ancestry_hits
 
             try:
-                ancestry_hits = asyncio.run(_ancestry_fallback())
+                # asyncio.run() fails here under Modal (already inside
+                # nj_weekly_all's running loop); _run_coro_blocking offloads
+                # to a worker-thread loop in that case, runs directly locally.
+                ancestry_hits = _run_coro_blocking(_ancestry_fallback())
                 if ancestry_hits:
                     confirmed += ancestry_hits
                     # Enrich Ancestry hits with DuckDuckGo obituary text for heir extraction
                     for notice, raw_name, is_tax_name, result in ancestry_match_data:
                         confirmed_name = result.get("full_name", "")
                         city = notice.city.strip() or "Knoxville"
+                        _anc_state = _state_name(notice.state)
                         source_url = result.get("source_url", "")
                         source_type = "ancestry"
 
                         # Try DuckDuckGo search using the Ancestry-confirmed name
                         ancestry_parsed = None
                         if confirmed_name:
-                            obit_results = _search_obituary(confirmed_name, city)
+                            obit_results = _search_obituary(confirmed_name, city, state=_anc_state)
                             if obit_results:
                                 for obit_r in obit_results[:3]:
                                     page_text = _fetch_page_text(obit_r["url"])
@@ -2637,6 +2996,7 @@ def enrich_obituary_data(
                                             city=city,
                                             address=notice.address,
                                             api_key=api_key,
+                                            state=_anc_state,
                                         )
                                         if parsed and parsed.get("confidence") in ("high", "medium"):
                                             parsed["_raw_obituary_text"] = page_text
@@ -2700,6 +3060,7 @@ def enrich_obituary_data(
 
     for j, (notice, parsed, url, source_type, raw_name, is_tax_name) in enumerate(matches, 1):
         city = notice.city.strip() or "Knoxville"
+        state_name = _state_name(notice.state)
         survivors = parsed.get("survivors", [])
         has_survivors = bool(survivors) or bool(parsed.get("executor_named", ""))
 
@@ -2730,7 +3091,7 @@ def enrich_obituary_data(
                         j, len(matches), co_owner_name,
                     )
                     verification = verify_heir_status(
-                        heir_name=co_owner_name, city=city, api_key=api_key,
+                        heir_name=co_owner_name, city=city, api_key=api_key, state=state_name,
                     )
                     co_owner_status = verification["status"]
 
@@ -2771,9 +3132,15 @@ def enrich_obituary_data(
                 "status": "verified_living",
                 "source": "probate_notice",
                 "rank": 1,
+                # Court-appointed executor IS the signing authority by
+                # definition — the whole reason probate names a PR is to
+                # designate who can sign on behalf of the estate. Without
+                # this flag, signing_chain_count comes back as 0 for every
+                # probate record (verified in the 2026-05-10 dry run).
+                "signing_authority": True,
                 "street": notice.owner_street,
-                "city": notice.owner_city or "Knoxville",
-                "state": "TN",
+                "city": notice.owner_city or notice.city,
+                "state": notice.owner_state or notice.state,
                 "zip": notice.owner_zip,
             }]
             error_info = {
@@ -2833,6 +3200,7 @@ def enrich_obituary_data(
                 api_key=api_key,
                 raw_name=raw_name,
                 max_depth=max_heir_depth,
+                state=state_name,
             )
             error_info["heir_search_depth"] = 1
             heir_verified_count += 1
@@ -2851,6 +3219,7 @@ def enrich_obituary_data(
                     original_url=url,
                     api_key=api_key,
                     address=notice.address,
+                    state=state_name,
                 )
                 if new_parsed:
                     parsed = new_parsed
@@ -2865,6 +3234,7 @@ def enrich_obituary_data(
                             api_key=api_key,
                             raw_name=raw_name,
                             max_depth=max_heir_depth,
+                            state=state_name,
                         )
                         error_info["heir_search_depth"] = 1
                         research_dm_count += 1
@@ -2886,6 +3256,7 @@ def enrich_obituary_data(
                     city=city,
                     address=notice.address,
                     api_key=api_key,
+                    state=state_name,
                 )
                 if fc_parsed:
                     parsed = fc_parsed
@@ -2905,6 +3276,7 @@ def enrich_obituary_data(
                                 api_key=api_key,
                                 raw_name=raw_name,
                                 max_depth=max_heir_depth,
+                                state=state_name,
                             )
                             error_info["heir_search_depth"] = 1
                             error_info["missing_flags"] = error_info.get("missing_flags", [])
@@ -2923,6 +3295,7 @@ def enrich_obituary_data(
                     name=search_names[0],
                     city=city,
                     api_key=api_key,
+                    state=state_name,
                 )
                 if extra_survivors:
                     parsed["survivors"] = extra_survivors
@@ -2935,6 +3308,7 @@ def enrich_obituary_data(
                             api_key=api_key,
                             raw_name=raw_name,
                             max_depth=max_heir_depth,
+                            state=state_name,
                         )
                         error_info["heir_search_depth"] = 1
                         error_info["missing_flags"] = error_info.get("missing_flags", [])
@@ -2959,6 +3333,7 @@ def enrich_obituary_data(
                         heir_name=spouse_name,
                         city=city,
                         api_key=api_key,
+                        state=state_name,
                     )
                     spouse_status = verification["status"]
 
@@ -3011,6 +3386,7 @@ def enrich_obituary_data(
                             heir_name=co_owner,
                             city=city,
                             api_key=api_key,
+                            state=state_name,
                         )
                         spouse_status = verification["status"]
                     ranked_dms = [{
@@ -3098,7 +3474,8 @@ def enrich_obituary_data(
                     j, len(matches), dm_name, dm_city_hint or "unknown",
                 )
                 addr = _lookup_dm_address(dm_name, dm_city_hint, api_key,
-                                          tracerfy_tier1=tracerfy_tier1)
+                                          tracerfy_tier1=tracerfy_tier1, state=state_name,
+                                          county=notice.county)
                 if addr.get("street"):
                     dm.update(addr)
                     source = addr.get("source", "unknown")
@@ -3134,7 +3511,7 @@ def enrich_obituary_data(
                 if dm is ranked_dms[0] and dm.get("source") != "estate_fallback":
                     dm["street"] = notice.address
                     dm["city"] = notice.city or "Knoxville"
-                    dm["state"] = "TN"
+                    dm["state"] = notice.state or "TN"
                     dm["zip"] = notice.zip
                     dm_addr_sources["property_fallback"] = (
                         dm_addr_sources.get("property_fallback", 0) + 1
