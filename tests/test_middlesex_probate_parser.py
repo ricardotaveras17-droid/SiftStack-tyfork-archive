@@ -313,6 +313,80 @@ def test_build_notice_populates_dm_fields_from_affiant():
     assert notice.decedent_name == "Luis R. Soto"
 
 
+# ── Administrator variants (Week 35, pk=5406369 Bryant) ────────────────
+#
+# NJ probate exposes several administrator sub-types the plain
+# type=="administrator" predicate silently discarded:
+#   - Administrator Ad Prosequendum (usually shortened to "Ad Pros") —
+#     appointed to prosecute a claim (wrongful death, PI) on behalf of the
+#     estate. Real DM with signing authority.
+#   - Administrator CTA / DBN / Pendente Lite — other Latin sub-types.
+# The picker now uses .startswith("administrator") (and .startswith("executor")
+# for symmetry) so every variant lands in the right priority bucket.
+#
+# Fixture: pk=5406369, Tamar F. Bryant (died at 49, March 2026 —
+# wrongful-death context). Party grid row 0 is "Administrator Ad Pros",
+# rows 1-2 are deceased next-of-kin (no useful DM). Pre-fix returned None.
+
+
+def test_pick_executor_administrator_ad_prosequendum():
+    """Bryant fixture: 'Administrator Ad Pros' must be picked — the exact
+    role type NJ uses for the wrongful-death path. Prior to the startswith
+    fix, _pick_executor returned None on this record."""
+    html = (FIXTURE_DIR / "middlesex_probate_detail_administrator_ad_pros_bryant.html").read_text()
+    parties = _parse_parties(html)
+    exe = _pick_executor(parties)
+    assert exe is not None, "Administrator Ad Pros must not be silently discarded"
+    assert exe["name"]     == "Keisha Chanel Wallace"
+    assert exe["type"]     == "Administrator Ad Pros"
+    assert exe["relation"] == "Spouse"
+    assert exe["status"]   == "Accept"
+
+
+def test_pick_executor_administrator_variants_startswith():
+    """Every 'Administrator *' sub-type NJ uses must match. Synthetic parties
+    covering the known Latin variants — regression guard so a future variant
+    (added by NJ or seen in another county) doesn't silently fall through."""
+    variants = [
+        "Administrator",
+        "Administrator Ad Pros",
+        "Administrator Ad Prosequendum",
+        "Administrator CTA",
+        "Administrator DBN",
+        "Administrator Pendente Lite",
+    ]
+    for v in variants:
+        parties = [{"name": f"Test-{v}", "type": v, "relation": "Child", "status": "Accept"}]
+        exe = _pick_executor(parties)
+        assert exe is not None,      f"variant {v!r} was silently discarded"
+        assert exe["type"] == v,     f"variant {v!r} not picked (got {exe.get('type')!r})"
+
+
+def test_pick_executor_executor_variants_startswith():
+    """Symmetric to Administrator — 'Executor *' sub-types must also match
+    even though we haven't seen one in the wild yet. Same class of bug."""
+    for v in ("Executor", "Executor CTA", "Executor Ad Litem"):
+        parties = [{"name": f"Test-{v}", "type": v, "relation": "Spouse", "status": "Accept"}]
+        exe = _pick_executor(parties)
+        assert exe is not None,  f"variant {v!r} was silently discarded"
+        assert exe["type"] == v, f"variant {v!r} not picked"
+
+
+def test_pick_executor_variant_priority_still_holds():
+    """The Bryant fix widens the Executor/Administrator predicates but must
+    NOT invert priority: plain Executor still beats Administrator Ad Pros,
+    Administrator still beats Applicant, etc."""
+    parties = [
+        {"name": "AdmAdPros",    "type": "Administrator Ad Pros", "relation": "Spouse", "status": "Accept"},
+        {"name": "ExecutorPerson","type": "Executor",              "relation": "Spouse", "status": "Accept"},
+    ]
+    # Executor wins even over Administrator Ad Pros
+    assert _pick_executor(parties)["name"] == "ExecutorPerson"
+
+    # Drop the Executor — Administrator Ad Pros must be next
+    assert _pick_executor(parties[:1])["name"] == "AdmAdPros"
+
+
 # ── CLI runner ────────────────────────────────────────────────────────
 
 
