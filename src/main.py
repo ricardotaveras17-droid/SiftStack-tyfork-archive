@@ -1101,12 +1101,23 @@ def _run_nj_scrape(args) -> None:
     do_slack = getattr(args, "notify_slack", False)
     headless = not getattr(args, "headed", False)
 
+    # Plumb the top-level enrichment-skip flags through to the scraper.
+    # Argparse already defines --skip-obituary and --skip-ancestry (used by
+    # daily/historical); they were silently ignored by nj-scrape before.
+    # Useful for local recovery runs where obituary Phase A is a ~25-min
+    # no-op on LP records (defendants are almost always living owners).
+    skip_enrichment = [
+        flag for flag in ("skip_obituary", "skip_ancestry")
+        if getattr(args, flag, False)
+    ]
+
     result = asyncio.run(
         __import__("nj_scraper").run_nj_scrape(
             counties=counties,
             headless=headless,
             upload_datasift=do_upload,
             notify_slack=do_slack,
+            skip_enrichment=skip_enrichment or None,
         )
     )
 
@@ -1132,12 +1143,20 @@ def _run_nj_probate(args) -> None:
     do_upload = getattr(args, "upload_datasift", False)
     do_slack = getattr(args, "notify_slack", False)
 
+    # Same plumbing as nj-scrape — top-level --skip-obituary / --skip-ancestry
+    # flags were previously silently ignored on nj-probate.
+    skip_enrichment = [
+        flag for flag in ("skip_obituary", "skip_ancestry")
+        if getattr(args, flag, False)
+    ]
+
     result = asyncio.run(
         __import__("nj_middlesex_probate").run_middlesex_probate_scrape(
             days_back=days_back,
             headless=headless,
             upload_datasift=do_upload,
             notify_slack=do_slack,
+            skip_enrichment=skip_enrichment or None,
         )
     )
 
