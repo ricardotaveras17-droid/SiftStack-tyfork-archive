@@ -319,32 +319,43 @@ def _pick_executor(parties: list[dict]) -> dict | None:
     """Pick the primary decision-maker fiduciary from the parties grid.
 
     Priority order:
-      1. Executor with status=Accept        (named in will, formally accepted)
-      2. Administrator with status=Accept   (no will, court-appointed, accepted)
-      3. Applicant with status=Accept       (person who applied to open the
-                                             estate — in NJ Middlesex, "Applicant"
-                                             is the type used when there's no will
-                                             and the applicant becomes the
-                                             administrator upon acceptance)
-      4. Affiant with status=Accept         (Affidavit of Small Estate path —
-                                             the person taking possession and
-                                             distributing assets when the estate
-                                             value is under the NJ small-estate
-                                             threshold and no formal executor is
-                                             appointed)
-      5. Executor (any status)              (edge cases: pending, renounced)
-      6. Administrator (any status)
+      1. Executor* with status=Accept        (named in will, formally accepted)
+      2. Administrator* with status=Accept   (no will, court-appointed, accepted)
+      3. Applicant with status=Accept        (person who applied to open the
+                                              estate — in NJ Middlesex, "Applicant"
+                                              is the type used when there's no will
+                                              and the applicant becomes the
+                                              administrator upon acceptance)
+      4. Affiant with status=Accept          (Affidavit of Small Estate path —
+                                              the person taking possession and
+                                              distributing assets when the estate
+                                              value is under the NJ small-estate
+                                              threshold and no formal executor is
+                                              appointed)
+      5. Executor* (any status)              (edge cases: pending, renounced)
+      6. Administrator* (any status)
       7. Applicant (any status)
       8. Affiant (any status)
       9. Anything with "fiduciary" in the type
+
+    Executor* / Administrator* use startswith rather than equality so NJ's
+    role-type variants land in the right bucket:
+      - Administrator Ad Prosequendum ("Ad Pros") — appointed to prosecute a
+        claim on behalf of the estate (wrongful death, PI). Real DM.
+      - Administrator CTA (Cum Testamento Annexo)  — will present but no
+        executor named / all executors declined.
+      - Administrator DBN (De Bonis Non)           — original administrator
+        died mid-administration.
+      - Administrator Pendente Lite                — during litigation.
+      - Executor CTA / Executor Ad Litem           — analogous will variants.
     """
     priorities = [
-        lambda p: p["type"].lower() == "executor"      and p["status"].lower() == "accept",
-        lambda p: p["type"].lower() == "administrator" and p["status"].lower() == "accept",
-        lambda p: p["type"].lower() == "applicant"     and p["status"].lower() == "accept",
-        lambda p: p["type"].lower() == "affiant"       and p["status"].lower() == "accept",
-        lambda p: p["type"].lower() == "executor",
-        lambda p: p["type"].lower() == "administrator",
+        lambda p: p["type"].lower().startswith("executor")      and p["status"].lower() == "accept",
+        lambda p: p["type"].lower().startswith("administrator") and p["status"].lower() == "accept",
+        lambda p: p["type"].lower() == "applicant"              and p["status"].lower() == "accept",
+        lambda p: p["type"].lower() == "affiant"                and p["status"].lower() == "accept",
+        lambda p: p["type"].lower().startswith("executor"),
+        lambda p: p["type"].lower().startswith("administrator"),
         lambda p: p["type"].lower() == "applicant",
         lambda p: p["type"].lower() == "affiant",
         lambda p: "fiduciary" in p["type"].lower(),
