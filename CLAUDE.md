@@ -14,9 +14,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 6. **Lead Management:** 4 Pillars of Motivation auto-qualification, STABM daily routine, pipeline reporting, deep prospecting (4-level framework)
 7. **Operations:** Acquisition playbook generator (SOPs, scripts, checklists), Slack/Discord notifications, Google Drive upload, Apify Actor deployment
 
-Currently focused on Knox and Blount counties, Tennessee.
+Currently focused on Knox and Blount counties, Tennessee. A realtor sphere-of-influence beta runs on the Columbus OH metro (the `soi_*` modules; see "Sphere of Influence Pipeline").
 
-8. **REI Skill Library:** 19 Claude Co-Work skill files (`.skill`/`.plugin` ZIPs) for distribution to DataSift community via [learn.datasift.ai/claude-skills-rei](https://learn.datasift.ai/claude-skills-rei). Skills teach Claude specific REI workflows when uploaded to Co-Work sessions or Projects.
+8. **REI Skill Library:** 21 Claude Co-Work skill files (`.skill`/`.plugin` ZIPs) for distribution to DataSift community via [learn.datasift.ai/claude-skills-rei](https://learn.datasift.ai/claude-skills-rei). Skills teach Claude specific REI workflows when uploaded to Co-Work sessions or Projects.
 
 ## Commands
 
@@ -149,6 +149,95 @@ Each scraped notice gets a full-page screenshot of its detail page on tnpublicno
 - **Hosting:** Apify run pushes each PNG to the key-value store and sets a shareable URL (mirrors the deep-prospecting PDF pattern). CLI run uploads to Google Drive when `GOOGLE_DRIVE_FOLDER_ID` + `GOOGLE_SERVICE_ACCOUNT_KEY` are set, else falls back to the local path. Helpers: `host_screenshots_via_drive()`, `set_local_screenshot_urls()`.
 - **Delivery to DataSift:** the URL rides along as the `Notice Screenshot` custom field plus a "Notice Screenshot:" line in record Notes (`datasift_formatter`). DataSift's CSV upload cannot push an image into the REISift Gallery panel, so the link is the supported route.
 
+## Scheduled First-to-Market Pull (build 1.0.42, 2026-08-14)
+
+The TN Public Notice scrape now runs unattended in the cloud instead of on a workstation, and covers **probate as well as foreclosure** for Knox and Blount. Entry points: `src/ftm_runner.py` (one run) and `src/ftm_schedule.py` (the long-lived scheduler, the container's CMD). Full runbook: `deploy/FTM_RUNBOOK.md`.
+
+```bash
+python src/ftm_runner.py --doctor              # credentials, egress, state dir, searches
+python src/main.py list-searches               # dump the LIVE saved-search dropdown labels
+python src/ftm_runner.py --max-notices 2       # bounded dry run, writes nothing
+python src/ftm_runner.py --commit              # the real thing
+python src/ftm_schedule.py --next              # next 5 fire times, business-local
+```
+
+**THE SCRAPE IS GATED ON EGRESS, NOT ON CODE. This is the finding that reframes everything else.** tnpublicnotice.com decides per-IP whether it will serve notice detail pages at all. Verified live 2026-08-14 against the same logged-in account: from the office IP the page carries **no CAPTCHA whatsoever**, just "You are not permitted to view public notices from this computer at this time"; through an Apify datacenter proxy the same notice serves the normal Turnstile gate and the text; through Scrapfly residential it serves with no gate at all. A Fly machine is a datacenter IP by definition, so `proxy_resolver.py` is mandatory infrastructure, not an optimization. Resolution order: `SIFTSTACK_PROXY_URL` -> `APIFY_PROXY_GROUPS` + `APIFY_TOKEN` (the API token is NOT the proxy password; it is used to look the password up) -> direct. Apify's RESIDENTIAL group is **not on the current plan** (`availableCount: 0`); `BUYPROXIES94952` (27 US datacenter IPs) clears the block today. A run blocked this way exits **3**, distinct from a normal failure, because no retry fixes it. The CLI path previously had no proxy support at all while the Apify Actor did, which is exactly why the scrape worked in the cloud and died on a workstation.
+
+**The gate is Cloudflare TURNSTILE, and the old solver never solved it.** `config.py` had recorded the 2026-07-13 migration but `captcha_solver.py` still called `solver.recaptcha()` and injected into `g-recaptcha-response`, a field the page no longer reads: every solve was billed and discarded. It now selects method and response field off `CAPTCHA_KIND`, reads the sitekey off the **live page** (a rotation logs `SITEKEY ROTATED` rather than silently killing the scrape), creates the `cf-turnstile-response` input when the headless widget never renders one, and runs the blocking 2Captcha call in a thread so the browser event loop keeps servicing the page. Verified live: gate cleared, notice text visible. **The gate is session-level, so one solve covers the rest of the run.** A blocked IP now raises `NoticeAccessBlocked` and aborts the whole run instead of grinding 50 results x 3 attempts against a wall.
+
+**Zero notices is a FAILURE.** Success requires positively seeing the notice body; there is deliberately no "the challenge markup is gone, so we must have passed" inference, which is precisely the reasoning that reported 13 consecutive dead runs as successful over 19 days. `ftm_runner` reports a 0-notice run as EMPTY and exits non-zero.
+
+**Probate (`Probate V2 Knox` / `Probate V2 Blount`, names verified live).** `main.py list-searches` dumps the real dropdown labels and flags configured-but-missing entries, because a mistyped saved search scrapes nothing and looks exactly like a quiet day. Three parsing bugs found by running real notices through the pipeline, all now regression-tested:
+- **The PR was the court.** "Notice to Creditors" names the role in prose ("issued to the referenced Personal Representative by the Chancery Court") before naming the human under a standalone `PERSONAL REPRESENTATIVE(S)` heading, so a same-line pattern set `owner_name` to "By The Chancery Court". Patterns are now tried block-form first, a rejected candidate falls through instead of ending the search, and court/clerk prose is in `_INVALID_NAMES`.
+- **The courthouse became the subject property.** A probate body's only street addresses belong to the court, the attorney, or the PR, so `_parse_address` now returns immediately for probate (it was uploading "400 W. Main Street", the Knox County courthouse). The real property is resolved downstream by `property_lookup` (Knox Tax API by decedent name -> executor family search -> people search), which works: a live run resolved 4100 Landon Dr from decedent "Doris O. Young".
+- **The vacant-land filter deleted the entire type.** It judges by house number and probate has no address yet, so on a mixed run every probate record vanished while the foreclosures came through and the run looked healthy. `NO_ADDRESS_TYPES = {"probate", "divorce"}` is exempt per-record, so the filter keeps doing its real job on types that do carry an address.
+
+**Two more fixes with reach beyond probate:** `max_notices` is now enforced **within** a results page (a cap of 1 still ground through all 50 results, paying a gate solve and screenshot for each, which matters because it is the cloud run's cost ceiling); and `_clean_and_split_name` no longer folds a spelled-out middle name into the surname ("Eric Lee Sharp" uploaded as last name "Lee Sharp", breaking record matching and skip trace), with a surname-particle list so "Van Buren" and "De La Cruz" stay whole.
+
+**Deployment: LIVE on Fly as `siftstack-ftm` (deployed 2026-08-14).** A separate app from the SMS agent's `siftstack` because the shapes are opposite: the SMS agent is a web service that must never stop, this is a 10-40 minute batch job idle the rest of the day, and sharing a machine would put a long scrape in contention with webhook handling. Four deliberate choices: the **Playwright base image is pinned to the client version** (the site is ASP.NET postbacks behind a JS gate, so there is no HTTP-only path); a **volume at `/data`** holds `seen_ids.json`, `last_run.json`, `cookies.json` and `ftm_runs.jsonl`, because losing the seen-ID cache means re-scraping and re-paying for months of notices; a **scheduler process rather than `fly machine run --schedule`**, since Fly's schedules are coarse and pick their own minute while a first-to-market pull wants a specific business-local hour; and **`FTM_ARGS` ships without `--commit`** so the first scheduled run does everything except write. `deploy/sync_ftm_secrets.py` pushes credentials from `.env` in one staged call, masked by default.
+
+**THE 407 THAT LOOKED LIKE BAD CREDENTIALS.** The first Fly deploy could not reach the site at all: 60s timeouts, then `407 Proxy Authentication Required` from Apify on a token and password that were byte-identical to the working local ones. The cause is that **Apify session ids accept only letters, digits, `_` and `.`** and `fly.ftm.toml` set `APIFY_PROXY_SESSION = 'tnpn-fly'`. Proven live from the machine on one credential set: `session-tnpn-fly` 407s while `tnpn_fly`, `tnpnfly`, `tnpn.fly` and `tnpn` all return 200. A hyphen in a session name is indistinguishable from a rejected password in the error, so `proxy_resolver._safe_session()` now rewrites illegal characters and logs the substitution. **The VM is `shared-cpu-2x` / 2GB, not 1x/1gb**: on one shared core Chromium took 60 seconds just to launch and the backfill would have run roughly twice as long as it needs to.
+
+**Backfill: the 1000-row cap is why 12 months was never reachable.** The site truncates EVERY result set at 20 pages / 1000 rows, newest first, so a plain 12-month search silently loses its tail: Knox foreclosure and Knox probate both sat on that ceiling showing only their most recent weeks. The site itself retains 12 months and no more ("Notices for the past 12 months are available in the current search"), so 12 is both the target and the maximum. `--backfill-months N` re-submits each saved search once per calendar month over an explicit date range (`rbRange` + `txtDateFrom`/`txtDateTo`, set after selecting the saved search so its keywords and county checkboxes stay intact), and `--backfill-offset M` shifts that window so one 19-hour job becomes twelve resumable ones. Measured monthly volume: Knox probate ~150, Knox foreclosure ~100, Blount probate ~80, Blount foreclosure ~33, about **4,350 raw notices over 12 months**. Resuming is cheap because the seen-ID check now reads the notice id out of the RESULTS GRID and skips before opening the page (was ~5s per already-seen notice, now zero).
+
+**Blount probate was returning nothing, for two stacked silent reasons.** `property_lookup._tpad_lookup` hit TPAD with bare `requests`: TPAD **403s anything without a browser User-Agent**, so every Blount lookup failed outright. Even fixed, the HTML page only ships an EMPTY table shell whose id is `searchResultsTable`, not the `resultsTable` the parser searched for; the rows come from `POST /TPAD/Search/GetSearchResults`, which returns clean JSON. Both failures were quiet (lookup returns [], address stays empty, validation later drops the record as "missing address"), so a Blount probate backfill would have produced ~950 records and zero usable ones. Also: **TPAD prints the house number LAST** ("LAKESHORE DR  5705"), which fails validation and Smarty unless normalized to "5705 Lakeshore Dr". A live test slice went from 0 usable to 3 of 5.
+
+**Trustee sales leak into the probate saved search.** Its keyword is "probate", which also appears in foreclosure notices, so a successor-trustee sale surfaces in probate results and uploads to the Probate list with the trustee's law firm as the personal representative (seen live: a Marinosci Law Group notice produced "PR = From Felicia F. Coalson"). `foreclosure_filter.looks_like_trustee_sale()` drops those, and requires the ABSENCE of a genuine probate anchor (notice to creditors, letters testamentary, personal representative) so a real estate filing that merely mentions a trustee still passes.
+
+**Probate notices never carry a phone number.** Measured on 10 Knox notices: 8 had no phone at all and the 2 that did carried the LAW FIRM's ("The Ebbert Law Firm ... Telephone (865) 234-2488", a successor trustee's office line). The PR is published with a mailing address only, so every probate phone must come from skip trace against the PR name and address; a number lifted from the notice body dials the estate's attorney.
+
+**Notice screenshots retired 2026-08-14** (Ty: not used for anything from TN Public Notice any more). Capture, Drive/Dropbox/KVS hosting and the CSV re-write are removed from the live path and the tooling is in `archive/notice_screenshots/`. It was also the slowest step in a foreclosure notice, which matters directly on a multi-thousand-notice backfill. The `notice_screenshot_path` / `notice_screenshot_url` fields, the CSV column and the DataSift custom-field mapping are deliberately KEPT so historical records retain their URLs.
+
+**BACKFILL COMPLETE 2026-08-16: 1,226 records, 936 distinct properties, all 12 months, 48 of 48 jobs.** Probate 786 / Foreclosure 476; Knox 910 / Blount 352. The daily schedule went live with `--commit` the same day (06:30 America/New_York).
+
+**The constraint that dictated the whole backfill shape: the site blocks an egress IP by VOLUME.** One month running all four searches through a single sticky Apify session viewed about **204 notices** before that IP began refusing, and every later month then failed in ~60s against the same dead IP. Two mechanisms fix it, and both are load-bearing: `ftm_runner` rotates to a fresh Apify session id per PROCESS (counter on the volume), and the backfill runs **one process per (saved search x month)**, 48 jobs, keeping the worst case (Knox probate ~150/month) under the threshold. Even so ~7% of jobs hit a burned IP; a retry pass that re-runs any non-zero exit with a fresh IP converged both stragglers within three passes. Do not "fix" a run of exit-3s by retrying immediately in a tight loop; the pool is 27 addresses and they need to cool.
+
+**seen_ids is persisted ONLY after a successful upload.** The scrape no longer writes it incrementally. Ordering is the whole point: the upload happens after the entire scrape, so persisting mid-scrape meant an aborted run left notices flagged as handled that were never sent anywhere. The first egress block did exactly that to **204 notices**, and a retry would have skipped every one of them permanently. `_revert_seen()` rolls back on failure, on `--no-upload`, and on any dry run.
+
+**Verified in production, not just in tests:** across the 675 post-fix rows checked mid-run there were 0 junk owner names, 0 courthouse addresses, 0 trustee sales on the Probate list, and 0 duplicate rows within a job, while legitimate multi-token surnames survived intact (St. John, St. Leger, Van Zandt, Van Gentry, VAN DAVIS). Repeats ACROSS months are expected and harmless: a foreclosure republished over a month boundary appears in both files and `POST /property/` upserts by address (confirmed by re-POSTing and getting the same uuid back).
+
+**The `county` stage now runs in the container** (was workstation-only): `_stage_county` falls back to `siftmap_standalone.SiftMapClient`, which needs nothing but `REISIFT_API_KEY`, when the Deal Room `_api` checkout is absent. A `capture` stage was added alongside it to snapshot the Knox City condemnation agendas, which are **overwritten at source** and cannot be recovered later, so it is in `DEFAULT_STAGES` despite uploading nothing. Live `FTM_ARGS` is `--stages notices,capture,county --commit`.
+
+**Also fixed here:** `python src/main.py <mode>` used to dispatch into the Apify Actor whenever `APIFY_TOKEN` was present in `.env` (it is, for `consolidate_foreclosures`), so every local CLI call died on "tn_username and tn_password are required". The Actor path now triggers only on `APIFY_IS_AT_HOME` (or an explicit `SIFTSTACK_FORCE_ACTOR=1`). `datasift_api_upload.env()` reads `os.environ` before falling back to a `.env` file, so the uploader works on a box that has no such file. State paths honor `SIFTSTACK_STATE_DIR` / `SIFTSTACK_OUTPUT_DIR` / `SIFTSTACK_LOG_DIR`. Saved-search selection and per-page postbacks wait on `domcontentloaded` rather than `networkidle`, which regularly never settles through a proxy and abandoned a working search after 30s.
+
+## FTM Daily Health Digest + Watchdog (build 1.0.50, 2026-08-31)
+
+`src/ftm_health.py` answers every morning whether the first-to-market data actually got pulled, and posts one short message saying so. Built because `ftm_runner._notify` fires only when a run COMPLETES: a stopped machine or a dead scheduler thread emits nothing at all, and a missing message reads exactly like a quiet morning. Measured over the nine scheduled days to 2026-08-28: five OK, three EMPTY, one egress-blocked, and nobody was told in a way that carried the trend.
+
+```bash
+python src/ftm_health.py                  # the two-line daily summary
+python src/ftm_health.py --full           # detailed report: feeds, stages, inventory
+python src/ftm_health.py --check          # one line, exit 1 if red (the watchdog probe)
+python src/ftm_health.py --selftest       # 45 assertions, no network, no writes
+python src/ftm_schedule.py --health-once  # post right now, as the scheduler would
+```
+
+**The post is deliberately two lines, three when broken** (Ty, 2026-08-31: the first version shipped at 1,490 characters and was too much to read at 8am). `WHAT GETS SAID IS NOT WHAT GETS CHECKED` — every test in `analyze()` runs on every pass; a green day just has nothing worth saying, and a red day surfaces its top finding as the single reason line, trimmed to one sentence by `_short_reason()` because the runner's empty-notices detail runs 180 chars and ends in a command to paste.
+
+```
+:white_check_mark: *FTM Aug 28* - 8 new records
+Foreclosure 8 - Probate 0 - Condemned 0
+```
+
+**Three counting rules, each from what the live volume actually showed:**
+- **UPLOADED IS NOT NEW.** `POST /property/` is upsert by address and the county stage re-uploads the same 10 condemnation rows every day (proven: the address column of `knox_ftm_pull_*.csv` hashes identically across 08-22, 08-25, 08-28). New is measured against `<STATE_DIR>/ftm_record_ledger.json`, seeded once from history excluding the reported day so day one does not claim 977 new records. Idempotent: re-running the same day counts zero.
+- **A ZERO DAY IS NOT A DEAD FEED.** Saved searches publish in bursts (Knox probate landed 08-24 and 08-25 and nothing either side), so the metric is DAYS SINCE a feed last produced, against `FTM_FEED_STALE_DAYS` (default 7), never a single quiet day.
+- **A SKIPPED STAGE IS NOT A HEALTHY STAGE.** `StageResult.ok` counts `skipped` as OK, so a county stage that loses its SiftMap client still exits 0 and Slack still shows green. The audit compares what ran against what `FTM_ARGS` asked for. Checked here rather than by changing the runner's exit contract, which the scheduler rides on.
+
+**Per feed, not aggregate.** The runner reports notices as one number, so 2026-08-28 uploaded 19 records that were all foreclosure while both probate feeds sat silent, and it read as healthy. Counts come by county x notice type off the day's CSV.
+
+**List names are read from the CSV's own `Lists` column, never re-derived**, because the two mappings in this repo disagree: `datasift_formatter.NOTICE_TYPE_TO_LIST` sends `code_violation` to "Code Violation" while `knox_ftm_pull.LIST_NAME` sends it to "Condemned", and knox_ftm_pull is what writes those rows.
+
+**`_csvs_by_day` must keep EVERY CSV per day, not the last one.** A day can hold several (the backfill wrote 48), and keeping one path per day undercounted the ledger seed by an order of magnitude (105 properties instead of 977).
+
+**Two layers, because a run cannot report on itself.** Inside the box, `ftm_schedule.py` fires the digest at `FTM_HEALTH_AT` (default 08:00 business-local, `off` disables) as a separate event kind interleaved with the run, not a second `FTM_SCHEDULE` slot, since every slot would otherwise run `FTM_ARGS`. It stays in the same process because the run history, seen-ID cache and ledger all live on one volume and Fly attaches a volume to one machine. Outside the box, `.github/workflows/ftm-heartbeat.yml` runs daily at 14:00 UTC on GitHub, SSHes in and reads `--check`; it parses the verdict off the printed line rather than trusting flyctl to propagate a remote exit code, because a watchdog that silently always passes is worse than none. **Scheduled workflows only run from the default branch, so the watchdog is inert until this is merged to `main`.** Repo secrets `FLY_API_TOKEN` (scoped `fly tokens create ssh`, one app) and `FTM_HEALTH_WEBHOOK` are already set.
+
+**Trade-off accepted:** reporting new records only means a healthy quiet day prints all zeros and resembles a broken one, so the tick against the siren is load-bearing rather than decorative. Amber renders as the all-clear, since amber means nothing is broken and its note is exactly the noise being cut.
+
+`FTM_HEALTH_WEBHOOK` falls back to `SLACK_WEBHOOK_URL`; register any new env var in `deploy/sync_ftm_secrets.py`'s `OPTIONAL` or it never reaches the machine.
+
+**Also fixed here:** `main.py`'s zero-notice alert passed the webhook URL and the message in the wrong argument order, so `requests` raised on a non-URL, `_send_webhook`'s bare `except` swallowed it, and that alert had never once fired since it was written. Exactly the class of silent failure it exists to warn about.
+
 ## Scraping Backend: Scrapfly (build 1.0.31+)
 
 The gated notice detail fetch (the "caps structure": residential proxy, anti-bot, reCAPTCHA, and the proof-of-source screenshot) can run through the **Scrapfly API** instead of the in-house Playwright + 2Captcha path. Selected by `SCRAPE_BACKEND` (defaults to `scrapfly` when `SCRAPFLY_KEY` is set, otherwise `playwright`).
@@ -159,6 +248,7 @@ The gated notice detail fetch (the "caps structure": residential proxy, anti-bot
 - **Tooling:** `scrapfly_spike.py --id <id>` validates one notice (gate clears + screenshot) before relying on it. `backfill_screenshots.py [--csv ...]` logs in once and backfills screenshots for a master list (e.g. the output of `consolidate_foreclosures.py`), writing `notice_screenshot_path` / `notice_screenshot_url` back to the CSV.
 - **Env:** `SCRAPFLY_KEY` (required), `SCRAPE_BACKEND`, `SCRAPFLY_COUNTRY` (default `us`), `SCRAPFLY_RENDER_WAIT_MS`, `SCRAPFLY_TIMEOUT_MS`, `SCRAPFLY_MAX_RETRIES`. Needs `scrapfly-sdk` (in requirements.txt).
 - **Open validation:** whether Scrapfly's ASP clears this site's in-page reCAPTCHA "View Notice" gate is confirmed per-notice by the spike. A `gate_not_cleared` result means the JS scenario action schema or an explicit CAPTCHA step needs a tweak.
+- **STATUS 2026-08-14: the route wired into `scraper.py` is the broken one.** `_scrapfly_notice()` calls `fetch_notice()` (a direct `Details.aspx?ID=` fetch), and the client's own `fetch_notice_via_search` docstring explains why that cannot work: every Scrapfly scrape gets a fresh ASP.NET cookieless session, so a detail fetch lands in a session that never ran a search and the server returns an unpopulated shell. Live result is `gate_not_cleared` on every notice, ~3 minutes each, before falling back to Playwright. `fetch_notice_via_search` (search + walk inside ONE call) **does** work: verified live returning real notice content with no gate at all from Scrapfly's residential IP. Until the saved-search equivalent of that in-session walk is built, **leave `SCRAPE_BACKEND=playwright`** (`.env` currently overrides it to `scrapfly`, which is what makes runs slow rather than wrong).
 
 ## Foreclosure Master List Consolidation (build 1.0.31+)
 
@@ -263,6 +353,34 @@ Four traps, each of which fails silently or cryptically:
 
 **Always upload one record and read it back before releasing the file.** That single habit caught the tag format, the entity-owner rejection, the option-UUID requirement and a list-name mismatch that would have silently attached nothing for 2,512 of 2,573 records.
 
+**THE OPEN API CREATE ROUTE DIED ON 2026-09-01 (fixed 2026-09-05).** `POST /property/` began
+returning HTTP 403 "You do not have permission to perform this action" for EVERY method (GET,
+POST, OPTIONS) under BOTH auth types (minted ty+2 JWT and the Api-Key), with the account itself
+unchanged: super-admin, active business plan, 89 of 100,000 records used. Five scheduled runs
+scraped cleanly and uploaded nothing; the ledger reverted seen-IDs each time so nothing was lost,
+and the watchdog is what finally said so. Records are now created through
+`POST /api/internal/property/` (`datasift_api_upload.create_property`), the same surface every
+other write already used. That route's contract differs from the old one in three measured ways:
+- **It does NOT upsert.** A duplicate address returns 400
+  `{"non_field_errors":["Property address already exists!"],"property":["<uuid>"]}`, which hands
+  the uuid back. `create_property` then ATTACHES the payload to that record: lists via
+  `/add-lists/` (a STRING title, one call per list), tags as a read-modify-write PATCH of the full
+  set, and the owner PATCHed only when the payload's owner differs. Lists and tags accumulate
+  exactly as before; the county stage's daily re-send of the same 10 rows reports
+  `created=10 (of which 10 already existed)`.
+- **`owner` is validated BEFORE the duplicate check**, so an address-only body 400s whether or
+  not the record exists. Callers that used the upsert as a lookup (dispo_flip_buyers' tag-by-
+  address, the probate one-offs) now go through `find_property` (POST-as-GET
+  `search: address_prefix:<street>`, matched on normalized street + zip5) and `attach_to_record`.
+- Lists by title and tags as an array are accepted as before; DataSift standardizes the street on
+  ingest ("6520 FLINT GAP RD" reads back as "6520 Flint Gap Rd"), which is why the lookup match is
+  case- and punctuation-insensitive.
+`create_property` falls back to the legacy route only on a 403 or 404, so a reversal at DataSift
+cannot break the uploader the other way. `tests/test_datasift_api_upload.py` pins all of it with
+a stubbed client. Whether `/property/` was retired on purpose is a question for DataSift
+engineering; the Open API key gets the same 403, so any community user on that documented route
+is broken too.
+
 ## Obituary Opportunity Ranking (build 1.0.37, 2026-08)
 
 `src/obituary_opportunity.py` turns a reisift account's **Obituary list** into a lean-budget call order. The premise: a notice-of-default owner is on every wholesaler's mail drop because the filing is public and machine readable, but a decedent home is only reachable after somebody researches who died, who inherited and who signs. That research is the moat. Chain: pull (detail + custom fields) -> gate -> six weighted components -> branded 6-sheet Excel. Read-only, runs on the no-expiry Api-Key account (`datasift-apikey` = ty+2).
@@ -286,6 +404,543 @@ python src/obituary_opportunity.py --min-months 6 --mail-cost 0.75 --touches 6
 **Every row ships a "Must verify" note**, because whether the person who died is the owner of record is NOT verifiable from CRM data. Zero ty+2 obituary records carry a probate open date, decedent name or resolved heir, so the whole research layer is still ahead and the spouse-obituary trap is live on every single row. Sheet 3 isolates the ~12 records that actually carry hard distress, since that is where the lien and tax-delinquency numbers exist at all.
 
 **Rate limit:** `/api/internal/` throttles hard. Six threads at ~7 req/s 429'd 529 of 740; single-threaded at ~2 req/s with backoff on the server's "available in N seconds" hint completed cleanly. `pull()` is resumable and checkpoints every 25 records.
+
+## County List Playbook shards: what SiftStack consumes (2026-08-31)
+
+`src/list_inventory.py`, `src/staging_build_39049.py`, `src/siftmap_pull.py` and
+`src/list_inventory_report.py` all read `https://learn.datasift.ai/county-data/<st>.json`
+(2-digit state shard, 5-digit FIPS keys inside). SiftStack is a READ-ONLY consumer: the
+page, the shards and their builders live elsewhere (`Interactive Educational Websites`
+for the page, `Deal Room Coaching Call/_api/` for the builders, runbook
+`_api/RESOURCE-PAGE-RUNBOOK.md`).
+
+**There are TWO shard families and they do not agree.** `/county-data/` scores each list
+**standalone** and is what these modules read. `/capture-data/` is the market share ladder,
+where every rung is **marginal** (it counts only the deals the rungs above did not already
+reach) and the list-size column is cumulative. The site shows the ladder and HIDES the
+standalone table wherever a county has one, so a segment's on-screen doors/deal is usually
+NOT the number in `county-data` that these scripts rank on. That is expected: standalone
+answers "is this list worth marketing to", marginal answers "what do I pull next without
+paying twice for the same deal".
+
+**THE CAVEAT THAT MOVES NUMBERS: `county-data` ships June 2026 as ZERO deals in every
+county.** `trend[Jun] == 0` in 216/216 TX, 87/87 OH and 95/95 TN, while the shard labels
+itself "2026-01 .. 2026-06 (6 complete months)". The window is a hard-coded constant and
+both families run the same query with the same dedupe; they just called the endpoint on
+different days, and deed recording lags 4 to 8 weeks (county sweep 2026-07-18, ladder
+sweep 2026-08-11/13). So every `deals`, `dpd` and `lift` these scripts read sits on a FIVE
+month denominator: Knox 745 against the ladder's 927, Harris 9,440 against 10,440, capture
+higher in 187 of 216 TX counties and lower in zero. The 37 `deep_fips` counties are a third
+generation, pinned to an older cached payload. **Anything that gates on lift (P1/P2
+selection in `staging_build_39049.select_segments`, the `list_inventory_report` P1/P2 split)
+is ranking on that short window.** The ordering is broadly preserved because the missing
+month hits all segments, but absolute doors/deal reads about 20% high. Agreed fix, not yet
+run: refill June against the same window plus a lag guard that refuses to ship a month
+reading zero or far below trend. A plain re-run of `national-sweep.py` does nothing, it
+skips any county already marked `"profile":"rich"`.
+
+Shipped 2026-08-31 on the page side (commit 7367bc0 on `main`, the only branch Amplify
+builds): the Excel export now mirrors the visible cards one tab each, and every displayed
+count is the rolling six month read. Full contract: the learning-pages `CLAUDE.md`.
+
+## ty+1 Staging Build-Out - Franklin County OH 39049 (build 1.0.45, 2026-08-19)
+
+One-shot build of the ty+1@dataflik.com staging account from the 5-day challenge structure, driven by the County List Playbook shard (`learn.datasift.ai/county-data/39.json` key `39049` - state 2-digit shard URL, per-county keys inside). Driver: `src/staging_build_39049.py` (phases `preflight/sequences/size/pull/feeders/crm-clear/crm-mirror/qa`, DRY by default + `--commit`, state `output/staging_39049_state.json`, idempotent + read-back everywhere). Auth: `src/reisift_session.py` holds the target token IN PROCESS with a `verify_target()` hard gate before every write phase (email + account uuid + live read), so nothing can write to production ty+2.
+
+**Auth reality:** ty+1 is reached by a PASTED JWT installed via `reisift_auth.py add datasift-admin <jwt>` (the Session auto-detects a valid one in the `_api` store). **Staff-to-staff impersonation is refused** - `POST /api/internal/impersonate/ty+1@.../` from the valid ty+2 staff token 403s empty-body, both raw and %2B-encoded. Password mint and refresh were also dead ends; a fresh cURL paste is THE unblock.
+
+**What is live in ty+1:** 19 P1 doors-per-deal lists (`Franklin OH P1-01 - <seg>` ...) with pulls submitted for 44,398 records; 48 SiftMap presets (46 segment feeders with auto-add + buy box + `year_built_min/max` 1940/2010, a manual sold-pull preset "Franklin OH - Sold Since 2023-01", and the self-cleaning "Franklin OH - Recently Sold - Suppress" with `in_my_account_mode: "in"` tagging `recently sold`); the full 20-folder / 98-preset challenge CRM mirror cloned live from ty+2 (uuid -> title -> uuid translation, per-folder counts verified); 9 custom lead statuses; the active "Recently Sold to Sold Status" sequence (tag added -> status sold, Transactions folder); all test sequences/presets/quick-filters wiped (sequence backups in `output/backups/`). All 74 marketing presets (folders 01-13) carry `any_structure_type: ["Single Family Residential"]` + `year: [1940, 2010]` + a data-driven 75-neighborhood exclusion set (Market Finder Ohio/Franklin extraction scored by investor transactions, margin, and buy box; `output/franklin_neighborhood_suppress.csv`). FTM investigation: `deploy/FTM_FRANKLIN_39049.md` (Franklin has NO provider data for tax sale / eviction / code violation / divorce; county-direct is the only way in; no paid signups needed).
+
+**Hard-won contracts (all verified live, most fail SILENTLY if wrong):**
+- Records-page must grammar: the year-built range key is **`year`, NOT `year_built`** (year_built is accepted and ignored - probe by count delta, never trust acceptance). Structure enum is exactly **"Single Family Residential"** ("Single Family"/"SFR" match nothing). Records with no year/structure value are EXCLUDED by these filters.
+- **Folder preset listing defaults to 10 rows** (`/filter-preset-folder/{uuid}/filter-preset/`): always pass `?limit=999` or exists-checks lie and re-creates 400 on the global unique-title constraint.
+- Create-by-title works: `POST /api/internal/list/` and `/tag/` take `{title}`. **`POST /api/internal/status/` requires `color`** - clone the full status object from the source account.
+- SiftMap sold/date filters are the **`extra_*` family**: `extra_last_sale_date_min`, `extra_is_last_sale_interfamily`, plus `in_my_account_mode: "in"` (scan only records already in the account) and `year_built_min/max`. Every guessed sold-date key name was silently ignored.
+- `POST /properties/add-properties-by-query/` returns `"Activity created successfully"` and processes **async server-side**; the ty+1 staging worker queue was nearly stalled (68 of 44,398 landed in 40 min; a prior-day 145k vacancy check sat at processed=0). Zero lists after 20 min does NOT mean the add failed - check `/api/internal/activity/` and the queue. Pre-creating the lists by exact title is safe: the add attaches by NAME.
+- ty+2's own presets carry **duplicated uuids** in `must_not.any_lists` and refs to deleted lists - dedupe and drop on any clone.
+- Sequences API: full CRUD on `/api/internal/sequence/`; folders on `/api/internal/sequence-folder/`; the sold sequence shape is trigger `property.tags.added` + condition `has_all tags_uuid` + action `set-field-value status=sold`.
+
+**Open items:** the P1 record landing (server queue; re-check with `python src/staging_build_39049.py --phase qa`); ty+1 has no AI addons so HOTTEST/STRONG `investor_score` presets read 0 until enabled; the 6 CALLER QUEUES presets point at ty+1's own user until staging callers exist; 4 named SiftMap presets left untouched (Okaloosa SFH, Karan Desai, Tyson Morrison, Nate Hirschberg); out-of-range-year records from the pre-filter pulls can be stripped from lists once landing completes.
+
+## Account Blueprint: clone ty+2's structure into any account (build 1.0.52, 2026-09-10)
+
+`src/clone_account.py` builds a DataSift account in the same structure as ty+2 over the API,
+for a community member on their own account or for staff setting up a client. Two steps, one
+portable file: `export` reads ty+2 LIVE into a title-keyed, uuid-free blueprint JSON; `apply`
+takes that file plus the TARGET's own credential and creates every family in dependency order,
+reads each object back, and writes a report. Package `src/account_blueprint/`; the apply side is
+stdlib-only and imports nothing from the Deal Room checkout. Ships as the `account-blueprint`
+skill with the current blueprint inside (`tools/sync_account_blueprint_skill.py` copies both;
+a test pins the copy to the source).
+
+```bash
+python src/clone_account.py --phase export                                   # ty+2 -> output/blueprints/ty2_<date>.json
+python src/clone_account.py --phase validate --blueprint <bp>
+python src/clone_account.py --phase plan  --blueprint <bp> --target you@x.com --jwt <paste>   # dry diff + TODOs
+python src/clone_account.py --phase apply --blueprint <bp> --target you@x.com --email you@x.com --password ... --commit
+python src/clone_account.py --phase apply --blueprint <bp> --target client@x.com --impersonate --commit   # staff, non-staff client
+python src/clone_account.py --phase apply ... --probe-only --commit          # one create + read-back per unverified route
+python src/clone_account.py --phase apply ... --move-presets --commit        # re-folder presets a source folder rename left behind
+python src/clone_account.py --phase verify --blueprint <bp> --target you@x.com --jwt <paste>   # read-only parity + counts
+python tests/test_account_blueprint.py                                       # 35 checks, zero network
+```
+
+**What the live export holds (2026-09-10, 250 calls, 149s, every family under the Open API
+key):** 20 preset folders / 98 presets (folders 01-06, 09-21 plus `default`, which is empty;
+07/08 Tier 2 are gone), 27 sequences in 5 folders, 13 task presets in 3 groups, 37 custom
+fields in 3 groups, 7 boards with their columns, 37 SiftMap auto-add presets, 56 lists, 30
+statuses (4 custom), and 21 of 236 tags. Exit 0, one `$unresolved` reference (a deleted column
+inside the already-inactive "Send to Deep Prospecting" sequence).
+
+**The Api-Key reads EVERYTHING.** Verified against ty+2 for statuses, lists, tags, users,
+custom fields and groups, task groups and presets, boards and columns, sequences and folders,
+preset folders and presets, and `map.reisift.io/filters/`. The staff-JWT fallback in
+`export._family` fired exactly once across two exports: `map.reisift.io/filters/` answered 401
+to the Api-Key on the second run and 200 on the first, so keep the fallback. Shapes that differ from the docs:
+`/api/internal/account/user/` returns a FLAT ARRAY (the old mirror's `_probe_map` did
+`r.get("results")` on it, swallowed the AttributeError, and shipped an EMPTY user index, which
+is why every ty+1 caller queue pointed at the wrong human); custom-field rows DO carry
+`group {id,label}`; task presets carry `assigned_to_user` as an object; columns are
+`{uuid,title,order}`; SiftMap rows carry `is_active:false` for soft-deleted filters.
+
+**A saved preset and a records search speak different shapes.** The saved `must` stores relative
+windows (`last_direct_mailed: ["36-months","month"]`, `last_updated_date`) that
+`POST /api/internal/property/` refuses with "Use YYYY-MM-DD"; the UI resolves them at query
+time. `count_shape()` drops those keys and flattens `ownerPropertiesOwned.show_properties`,
+and any count without them is labelled "date window ignored". 26 of 98 presets are affected.
+
+**Blueprint rules, each one a bug the old mirror had or would have had:**
+- Every cross-reference is `{"$ref": kind, "title": ...}` (column refs carry `board`, task-preset
+  refs carry `group`). The ONLY uuid in the file is `source.account_uuid`, kept so apply can
+  refuse to clone an account onto itself. `validate()` regex-scans the dump for uuids, phone
+  numbers and emails and REFUSES the file on any hit: ty+2's "Call New Lead" sequence carries a
+  real phone, a real email and an integration uuid.
+- Export is key-driven THEN sniffed: known keys (`any_lists`, `any_tags`, `any_boards`,
+  `assigned_to`, `has_all tags_uuid`, `from_to column`, `task_preset`, `property-assign`) are
+  translated by meaning, then every remaining uuid-shaped string becomes a `$ref` or an
+  `$unresolved` marker. A field the hint table has never seen cannot smuggle a ty+2 uuid out.
+  The `create-task` payload key literally named `uuid` holds a timestamp, so matching is by
+  `UUID_RE`, never by key name.
+- `send-sms` / `send-email` actions are replaced by a `$manual` marker; apply drops them and
+  creates the sequence INACTIVE with a TODO. Absolute `end_of_day` timestamps are dropped
+  (the one on ty+2 was six months stale). `remove` actions name lists/tags by TITLE, and 91 of
+  the 114 tags in "Sold Property Cleanup V2" are cohort junk, so they are filtered to what the
+  blueprint carries.
+- Tags are pruned to those referenced by presets, sequences and SiftMap presets plus an anchor
+  allowlist; 134 of ty+2's tags are cohort/import junk (`2026-W27`, `pulled_*`, `DataFlik_*`,
+  the comma-string tag). A junk-shaped tag in a blueprint fails validation.
+- Duplicated uuids in `must_not.any_lists` are deduped; the uuid-titled junk list is DROPPED,
+  not remapped to "Auction" as the ty+1 build guessed. Users ship as first name + role only.
+
+**Apply rules:**
+- `verify_target` (exit 3, a `SystemExit` subclass no per-item except can swallow): token email
+  == `--target`, account != blueprint source (ty+2 has 11 users, so a different email is NOT a
+  different account), 30 min left, no `staff` flag unless `--allow-staff-target`, impersonated
+  tokens must carry the flag and differ from the staff account, a live sequence read must
+  return the claims account, Api-Key tokens refused (no claims). Verified live: the gate
+  refused ty+2 as its own target; with `--allow-same-account` a dry run indexed all nine
+  families of the live account with zero writes.
+- Order: statuses, lists, tags, custom fields, task presets, boards (RESOLVE ONLY, never
+  created), presets, sequences, SiftMap. Every listing passes `?limit=999`/`10000`; a 429 on a
+  listing RAISES instead of reading as "nothing here" (which is what re-creates lists, tags and
+  sequences, none of which have a unique-title constraint). A network error after a POST
+  re-lists by title before any retry.
+- Presets: exact `filters.must` equality on read-back (`_mk_preset` rule), `filters.account`
+  rewritten to the target, `must_not.any_neighborhood` stripped by default (69 presets carry
+  15 Knox strings; `--keep-neighborhoods`), a global title index across ALL folders because
+  titles are account-unique, and **a preset with ANY dropped reference is not created**: Ready to
+  Call minus its Priority 1 gate is every record with a phone, a different population wearing
+  the same name. Unresolvable `assigned_to` (the 6 CALLER QUEUES presets) maps via
+  `--user-map "Adriana=Jane"` or falls back to the applying user as a logged placeholder + TODO.
+- Sequences: a missing TRIGGER reference (board/column) skips the sequence; a missing ACTION
+  reference skips it too unless `--stub-inactive`, which creates it inactive minus that action.
+  Read-back is sent-subset-of-got on trigger/conditions/actions/is_active.
+- SiftMap presets are created with `auto_add_enabled` FORCED OFF unless `--siftmap-auto-add`,
+  because auto-add spends the target's record allowance the moment it exists, and the 37 carry
+  Knox/Blount addresses.
+- Statuses: custom only, full object with `color`; system statuses missing in the target are a
+  gap. Casefold matches (`Cold Lead` vs `cold lead`) map instead of creating and rewrite the
+  preset strings.
+- Unverified create routes (`task-group`, `task-preset`, `sequence-folder`, `custom-fields/group`)
+  go through `probe.create`: the FIRST real object is POSTed and read back before the batch
+  continues; 404/405 marks the family manual (every payload lands in the report), 400 stops it
+  with the body verbatim. No sentinel objects, since the DELETE routes are equally unverified.
+  `--probe-only --commit` does one create per route and stops.
+- Exit codes: 0 verified (gaps reported), 1 invalid blueprint, 2 any read-back mismatch (the run
+  continues so the report is complete), 3 refused. Report `.md` + `.json` per run, state file
+  keyed by title with the target account pinned, resume adopts whatever already landed.
+
+**LIVE ON ty+1 (2026-09-10, fresh ty+1 paste, `--allow-staff-target --move-presets
+--skip siftmap`).** `plan` -> `--probe-only --commit` -> `--commit` (three passes, each resuming
+what the previous one landed) -> `verify`, final exit 0. ty+1 now reads back at parity with the
+blueprint on every applied family: 56 lists, 21 tags, 37 custom fields (33 created), 13 task
+presets (all created), 7 boards (Deep Prospecting created plus 12 columns), 98 presets (14
+created, 12 MOVED out of the August "05/06. TIER 1 - FTM" folders into "05/06. FTM"), 26 of 27
+sequences (24 created; the missing one is "Send to Deep Prospecting", inactive at the source
+and pointing at a deleted column). SiftMap was skipped on purpose: ty+1 is a Franklin OH
+account and 37 Knox feeders there would be clutter. **Every unverified create route answered:**
+`POST /custom-fields/group/`, `/task-group/`, `/task-group/{g}/task-preset/`,
+`/sequence-folder/`, `/siftline/board/`, `/siftline/board/{b}/column/` all create and read back.
+
+**Four server rules the live run taught, each now in code and in a test:**
+- **A task preset takes EXACTLY ONE assignee key.** `assigned_to_user`, `assigned_to_users`,
+  `assigned_to_role`: the other two must be ABSENT. An empty list 400s ("This list may not be
+  empty"), two non-null keys 400 ("can't be not null together"). The GET shape shows all three,
+  which is what misled the first payload.
+- **`create-task-by-preset` REQUIRES `end_of_day` on create** even though the source GET carries
+  it on only one sequence. It is the UI's 23:59:59.999 of today in the action's timezone, in
+  UTC; `translate.end_of_day_iso()` reproduces ty+2's stored value to the millisecond, and
+  apply always computes a fresh one rather than copying a stale timestamp.
+- **List titles are unique per account ignoring case and surrounding whitespace.** ty+2 holds
+  "Arrests " with a trailing space; the create 400'd against ty+1's "Arrests". Export strips
+  titles and apply adopts the target's form (`Registry._same`). Tags keep case significant
+  because ty+2 legitimately holds both "Foreclosure" and "foreclosure".
+- **Board column titles are unique the same way.** "Send Back to Lead Management" collided with
+  ty+1's "Send Back To Lead Management"; `Registry.column_uuid()` matches case-insensitively.
+
+**Dry-run honesty needed its own fix.** Containers created in the dry pass (task groups,
+sequence folders, custom-field groups, boards, columns, task presets) were not registered, so
+the first plan reported 13 task presets and 20 sequences as gaps the real run would create. A
+dry create now registers a `DRY-RUN-*` uuid so the plan is the plan.
+
+**What the verify count probe says about ty+1, and why it is right:** 12 presets match records,
+86 match zero, and 56 of those 86 are "gated on empty tag Priority 1 / Priority 2 / FTM".
+ty+1 never ran `priority_tags.py` and its SiftMap feeders tag nothing, so the whole call/mail
+system sits on tags no record carries. The structure is cloned; the tagging that feeds it is a
+separate job, which is exactly what the probe was built to say out loud.
+
+## Dispo Buyer Engine - Pending Flips (build 1.0.46, 2026-08-20)
+
+`src/dispo_flip_buyers.py` turns SiftMap's investor-transaction data into a live dispo buyer machine on ty+2: properties whose last sale is an ACTIVE investor purchase are owned right now by a buyer, so pulling them into the CRM makes the sequential call/text flows dial people who provably buy in this market. Phases `infra/pull/trace/flippers`, DRY by default + `--commit`, resumable state `output/dispo_trace_state.json`.
+
+```bash
+python src/dispo_flip_buyers.py --phase infra --commit     # list + tags + presets (idempotent)
+python src/dispo_flip_buyers.py --phase pull --commit      # bulk add pending flips
+python src/dispo_flip_buyers.py --phase trace --limit 25 --commit   # principal skip trace
+python src/dispo_flip_buyers.py --phase flippers --limit 300        # exited-flipper CSV (free)
+```
+
+**THE SEMANTIC TRAP: the filter key labels the LAST SALE, not the current owner.** The SiftMap key is `extra_last_sale_investor_transaction_type` (takes a LIST - a comma string 400s; options pending/wholesale/wholetail/flip/rental, dug out of the live SiftMapPage bundle, webpack module 47865 `FINANCIAL_DETAILS`). Verified on live Knox samples: **"pending" = investor bought, exit pending, current owner IS the investor** (Volhomes LLC, Weaver Doors LLC) - this is the bucket that becomes CRM records. **"flip" = the flip EXIT was the last sale, current owner is the RETAIL homebuyer** (Christine Korf bought from GDP Properties LLC) - texting those records reaches ordinary homeowners. The flipper there is the last-sale SELLER, so the flip bucket feeds `--phase flippers` (ranked exited-flipper CSV, recency-capped `--months 24`) and never a record pull. Every candidate key guess before the bundle dig was SILENTLY ignored (count identical to baseline) - probe by count delta, never trust acceptance.
+
+**What is live in ty+2 (2026-08-20):** list "Dispo - Flip Buyers" (2,082 records landed: Knox 1,654 + Blount 430 pending, 335 new to account, rest were existing acquisition leads that got list-attached); SiftMap auto-add presets "Dispo - Pending Flips - Knox/Blount" (ids 9317/9318, auto_add ON, replace_owners OFF) so new pending flips keep flowing; CRM folder "21. Dispo Sequential Marketing" with 7 presets mirroring the P1 system (see below); tags "Dispo Buyer" + "Dispo Traced" only.
+
+**PRESETS MIRROR THE PRIORITY 1 SYSTEM - COUNTER-DRIVEN, NO FLOW TAGS (Ty).** The first build used a tag-gated pendulum (`dispo_sms_sent` -> `dispo_called_dayN`); Ty rejected it: no underscore tags, mirror P1 exactly. P1's real grammar (read from the live "Hottest - *" presets): progression rides the DIALER'S OWN COUNTER - `predictivecall_attempts [0,0]` is Ready to Call, `[1,1]` is Call Attempt 1 - plus `skiptraced`/`phone` flags; the only tags are plain-name anchors ("Priority 1", "FTM") and must_not ("recently sold", "Mail Only"). The dispo mirror: `Dispo - 00 Needs Skipped / 01 Skipped No Numbers / 02 Ready to Text / 03 Ready to Call / 04-06 Call Attempt 1-3`, anchored on the VIP list, text and call as PARALLEL lanes (like P1's CALL and MAIL folders), text lane on `sms_attempts [0,0]` (a live counter: 415 account records carry sends), must_not "recently sold" tag + sold/not_interested status. Live counts at build: 01 = 24 (skiptraced, no numbers -> entity-trace candidates), 02 = 208, 03 = 208. A preset that gates calling behind a texted-tag shows 0 forever and reads as broken - that was the "Ready to Call is empty" bug. Tag-removal contract: `POST /api/internal/property/{uuid}/remove-tags/` takes TITLES (`{"tags": ["name"]}`); uuids return 200 with `removed_tags: []` (silent no-op). `DELETE /api/internal/tag/{uuid}/` 400s (empty body) while the tag INDEX still shows attached records - the index lags the detail truth by ~30s; wait and retry.
+
+**The trace phase writes the BUYER's contact onto each record without touching owners.** Most pending records were already in the account as old acquisition leads, so their CRM owner is the PREVIOUS seller (PR/heir data included) - the pull deliberately keeps `replace_owners: False` and trace resolves the real buyer per record instead: SiftMap detail -> current deed owner -> if entity, reverse the mailing address through SiftMap owner_info (the Harper move, FREE - live hit: Bella Vista Customs LLC -> Paul S Blake) -> Enformion BusinessV2 officers on a miss -> person search phones anchored at the principal's mailing city -> `POST /api/internal/owner/{uuid}/upsert-phones/` (phones tagged `dispo`, merge semantics preserve existing numbers) + provenance note + `dispo_traced` tag via address-upsert (tags accumulate, owner key omitted = owner untouched). Verified live read-back on 1713 Rambling Rd: Pittman Properties Knoxville -> BusinessV2 -> Bradley C Sagraves -> 6 phones on the record. Person-owned records are skipped by default (`--all-owners` overrides) because DataSift's native unlimited skip trace covers humans; the entity principal is the part it cannot do.
+
+**Contracts learned here:** map `GET /filters/` pages at 10 rows and IGNORES `?limit=` - follow `next` or the exists-check lies and re-creates (live duplicate id 9319, deleted); `DELETE /filters/{id}/` works (204). SiftMap search rows carry the full address as ONE string (`address`); the detail record has NO street field at all - join on the row. `owner_info` mailing is the single string `owner_mail_address`. The records search is POST `/api/internal/property/` with `x-http-method-override: GET` - a bare POST would try to CREATE a property. `/properties/search/` response rows live under `data`. Record allowance check: `POST /api/internal/upload/usage/`.
+
+**VIP layer (`--phase vip`, Ty 2026-08-20): the campaign runs ONLY on never-contacted buyers.** Ty's read was correct and measured: **89% of the pending-flip owners were already in the marketing ecosystem** - of 2,082, only **234 qualified as VIP** (excl. reasons overlap: 1,618 carry a lead status, 1,294 owner-name-match a contacted record elsewhere in the account - the tired-landlord-owns-a-new-flip case, 406 sit on marketing lists, 14 have dial/SMS attempts). The gate per record detail: zero attempts on ALL four channels (`predictivecall_attempts`/`sms_attempts`/`rvm_attempts`/`directmail_attempts` all live on the detail), no status EVER (even sold), no outreach tags, no list beyond `CLASSIFICATION_LISTS` (DataSift auto-attaches classification lists at ingest - a brand-new record arrived already on "Absentee Owners", so bare list-membership is NOT outreach evidence), and the owner-name cross-check against 26,134 contacted-owner names (all marketing-list members + every record with a status or mail attempts). Output list **"Dispo - VIP Buyers" (234, membership verified exactly; the `count` field lags - trust the page sweep)**; the 5 sequential presets were re-pointed at it (read-back verified) and the folder renamed **"21. Dispo Sequential Marketing"** so it sorts last, after 16. Acquisitions / 17. Transactions. "Dispo - Flip Buyers" (2,082) stays as the raw intelligence layer. Re-run `--phase vip` after auto-add feeds new records - verdicts and the contacted-owner set checkpoint to `output/dispo_vip_state.json` (delete `contacted_owners` there to refresh the name set). Records-search gotchas hit here: empty `must` 400s ("Filter can't be empty" - query the worked populations directly), and pagination hard-refuses offset+limit > 10,000 ("Can't fetch more than 10000 items!" - cap and log the truncation).
+
+## Dispo Buyer Registry + Deal-Blast SMS (build 1.0.49, 2026-08-28)
+
+The dispo side gets what acquisitions already had: a deduped list of PEOPLE with scored phones, and an automated program that texts them. `src/dispo_buyers.py` builds the registry (phases `sweep / hydrate / aggregate / unmask / principals / skipinput / score / qa`, DRY by default, resumable state in `output/dispo_buyers/`). `src/sms_agent/dispo_campaign.py` stages the blast, modeled on `heir_campaign.py`: it reuses `seed.build()` for every guard, swaps in deal wording, and re-validates under a new buyer profile.
+
+**The message shape is Ty's (2026-08-28): the ROAD NAME and the AREA, never the exact address, plus the PRICE.** Interest converts to a phone call with a human; the agent never negotiates and never sends the address. That one sentence drove the whole design, and the deal sheet enforces it structurally: `load_deal()` REFUSES a `road` starting with a house number or a zip anywhere, so the address cannot leak because it never enters the process.
+
+**Filter contract, all verified live by count delta before any code was written.** `search` in the `addresses[]` block must be the bare county name: "Knox" returns 153,675, "Knox County, TN" returns **0**, which is indistinguishable from an empty segment. **An unknown filter key is SILENTLY IGNORED** (a deliberately bogus key returned a byte-identical count), so acceptance proves nothing. `extra_collapse_by_owner` is real and is the lever that makes the sweep cheap (Knox pending 1,633 -> 1,140 rows). Search rows carry **no owner name**, so hydration is unavoidable; they DO carry `saved_uuid`, the CRM record id. **`sale_history` is ordered NEWEST FIRST** (18 of 18 multi-sale properties strictly descending) and that ordering is load-bearing, because the flip branch reads `sale_history[0].seller_name`.
+
+**The semantic trap, restated because it is the one that ruins the list.** `pending`/`wholesale`/`wholetail`/`rental` mean the investor still holds, so the CURRENT OWNER is the buyer. `flip` means the exit already happened, so the current owner is a RETAIL HOMEBUYER and the person we want is the last-sale SELLER. Hold types are swept collapsed; exit types must NOT collapse, because each sale is needed to read its seller.
+
+**Dedupe is mailing-address clustering WITH a suite guard, and both halves are measured.** Clustering catches what name-matching misses (`DEVELOPERS TEAM 1 LLC` vs `DEVELOPERS TEAM I LLC`, digit vs letter; `GDP PROPERTIES LLC` vs `GDP PROPERTIES LLC PRO SOURCE HOME BUYERS`). Unguarded it over-merges: `9111 Cross Park Dr Ste D200` hosts NS Homes LLC and R D Properties Group LLC, unrelated companies sharing an agent. So an address carrying `STE|SUITE|UNIT|APT|BLDG|FL|PMB|RM` requires a fuzzy name match too, and every merge and every refusal is written to `merge_report.json` with its reason. Normalizers are IMPORTED from `enterprise_prospects` (`norm_name`, `strip_unit`, `ORG_RX`, `classify_one`) rather than rewritten; three incompatible ones already existed.
+
+**Cost order: the free step runs first.** `unmask` reverses each LLC's mailing address through SiftMap (the Harper move) at $0. Only what that misses is worth Enformion BusinessV2 at $0.10 (`principals`, gated on `--commit`). `skipinput` then projects the registry into a SmartSkip upload, whose required columns (First Name, Last Name, Mailing Address) are the registry's natural key. **SmartSkip is free up to `pay`**, so the quote is read before spending.
+
+**TWO SILENT TRAPS FOUND IN THE SCORE PHASE, both would have wasted money or corrupted records.**
+- **The do-not-call flag lives ONLY on the search row.** A number returned as `doNotCall: true` by `/property/` search comes back from `/property/{uuid}/` with the field **absent**, not false. A DNC filter written against the full record can never fire, so it would pay Trestle to score numbers the seeder then refuses to text. The DNC set is built from the search rows; coverage is partial by construction, since the search returns one representative phone per record.
+- **`crm.get_record` swallows a 429**, logs a warning and returns nothing, which silently drops that record's entire phone list while the run still reports success. `_get_record()` retries with backoff, and a gate fails the phase if too many stay unreadable. The fix recovered 23 phones on a 165-record cohort.
+- Also caught by its own read-back test: adding a tier with a set union left a re-scored phone carrying **two** tier tags at once, matching two lanes. Other tiers are stripped before the new one is added.
+
+**THE ENTERPRISE TAXONOMY EXCLUDES THE BEST DISPO BUYERS WE HAVE, so `local_tier()` wraps it.** `classify_one` was calibrated for a nationwide enterprise list where volume means 6-month purchases across the country and "construction" means D R Horton. On a county sweep it is wrong twice, both measured on the real registry: (1) below its volume floor of 10 any generic keyword is an outright EXCLUDE, and nearly every local investor is below that floor, so CREEKSTONE CONSTRUCTION LLC (9 buys), MCCARLEY CONSTRUCTION LLC (6) and HEMBREE BUILDERS LLC were all dropped as "homebuilders" when a local construction LLC buying 3 to 9 houses a year is a **self-performer**, the exact buyer this team's own dispo doctrine says takes a heavy-rehab deal when GC-model flippers cannot; (2) it matches keywords as SUBSTRINGS, so "BANK" inside "WILLBANKS" excluded a real buyer with 4 purchases. A generic match becomes REVIEW (kept, flagged) and any keyword failing a word-boundary re-check is a false positive. Exclusions fell from 177 to **25**, recovering 152 buyers; the 25 that remain are right (D R Horton, Clayton, Habitat for Humanity, City of Knoxville, Town of Farragut).
+
+**Live results (ty+2, 2026-08-28), full run.** Sweep **6,508 unique properties** (Knox pending 1,140 / wholesale 33 / wholetail 159 / rental 1,930 / flip 2,013; Blount 352 / 4 / 41 / 512 / 324), hydrated 6,501 with an owner and 2 errors at ~2 req/s. Aggregate: **4,286 unique buyers** from 6,501 observations, 2,985 entities and 1,301 people, 3,513 with a mailing address, 135 buying in both counties, 277 merged by mailing address and 61 refused by the suite guard. Unmask resolved **1,173 principals for $0** (a 40% hit rate on entities, about $117 of Enformion calls avoided), leaving 1,250 entities for the paid pass. `skipinput` projects **1,916 people** ready for SmartSkip (1,052 owners plus 864 resolved principals). The output validates against known ground truth: it independently rediscovered **Jonathan Harper -> TN Super Props 1 LLC**, the principal the original 158 Old State buyer sweep found by hand.
+
+Hydration hung once on compounding 429 backoff and had to be restarted; it is resumable and the checkpoint interval was cut to 100 so a stall costs less. Do not raise worker count to fix slowness, the detail cap is aggregate.
+
+**Contact resolution, and the four bugs the spot-checks caught.** The paid Enformion pass runs behind `--min-buys` (default 2), because of the 1,257 unresolved entities that still carry a mailing address only 264 bought more than once: $26.40 instead of $125.70 for the part of the list that matters. It resolved **193 of 264**. Then the read-back found four things that would each have poisoned the output:
+- **THE REGISTERED AGENT IS USUALLY THE COMPANY'S LAWYER.** 135 of 193 officers came back titled AGENT or REGISTERED AGENT, and texting a firm's attorney a deal blast is precisely the litigation bait this program avoids. But an agent title is not automatically wrong, since plenty of small operators are their own agent. `principal_confidence()` trusts an ownership title outright, trusts an agent title only when a name token also appears in the COMPANY name ("Turner Homes LLC -> Michael L Turner", "Smithbilt LLC -> Smith Kenneth" are obviously the owner; "New Season Properties LLC -> Dryer and Associates" is obviously not), and holds the other 122 back from the text list.
+- **Local law firms wear person-shaped names.** The stock `AGENT_FRONTS` list only knows the national commercial agents, so `DRYER AND ASSOCIATES P C`, `CHAMBLISS BAHNER & STOPHEL PC` and `BENNETT LAW OFFICE PC` all arrived as "principals". `FIRM_RX` catches them. A first version matching a bare `&` was far too blunt: it threw away 32 real married couples ("Oneal Brian A & Ethel L") to catch 5 firms, so the rule now needs an explicit professional marker.
+- **County records write LAST FIRST.** `clean_owner_name` read "KNOX JAMES" as first=Knox last=James. When the person came from an entity there is a free oracle: whichever of their tokens also appears in the company name is the surname. 45 rows corrected. Two portmanteau cases (Smithbilt) stay wrong and are left alone, because the prefix rule that would fix them also breaks "Aprilflipstn Llc -> April Marsh", where April really is her first name.
+- **A legal-status token is not a surname.** "Morales Family Trust" resolved to first=Morales last=Tr. 85 such rows dropped.
+
+**SmartSkip wants the STREET, not the whole address line.** SiftMap returns the mailing address as one string, and the first submission mapped that entire string to `mailingAddress` with no city, state or zip, which would have paid full price for a degraded match. `split_mail()` splits it and the re-submission mapped all six fields. Always check the `mapped` block the submit call echoes back.
+
+**Skip trace results (2026-08-28).** Ty set the trace floor at 2+ purchases as well, so 294 people went instead of 1,892: **$44.10 ceiling, billed on 206 actual hits.** 203 returned results (69%), 882 phones and 2,560 relatives, and the join back to `buyer_key` matched **293 of 293** through the input CSV as the bridge. Trestle scored 853 numbers for ~$13 with zero errors: 365 Dial First, 53 Dial Second, and **181 of 204 traced buyers (89%) carry at least one Dial First or Second number**. 6 records carry SmartSkip's deceased flag, which is unreliable and is stored as something for a human to verify, never acted on.
+
+**Scoring, and the reason the campaign was returning nothing.** On the existing `Dispo - 02 Ready to Text` cohort: 227 numbers scored for **$3.40**, 221 tier tags written, Dial First 151 / Second 14 / Third 19 / Fourth 25 / Drop 18. Before that, **exactly 1 of 165 records carried a dial tier**, because `dispo_flip_buyers --phase trace` writes phones tagged `dispo` and never scores them while `seed.from_preset` gates on the literal strings "Dial First"/"Dial Second". An unscored cohort is an empty cohort and looks exactly like a preset that matched nobody. After scoring, a dry blast staged **44 ready messages** from 63 mobile rows.
+
+**67% OF THAT COHORT IS FLAGGED DO-NOT-CALL** (110 of 165, same in both lanes). The flag is DataSift's own registry scrub (`source: REISIFT`) on skip-traced numbers, not a user action. It is treated as a hard block, which is conservative and shrinks the reachable universe a lot. Whether B2B deal distribution to an investor is exempt is Ty's call, not a code default.
+
+**The SMS side is a separate program, not a flag.** `respond.validate(program=)` gains a buyer profile where three rules invert: money is allowed **but only a figure on the approved deal sheet** (`allowed_prices`, so an invented price is still blocked and "92k" normalizes to 92000), distress vocabulary is permitted (it is ordinary deal description when selling TO an investor), and the zip check runs on the text with approved prices removed so a legitimate $92,000 does not read as a 5-digit zip. `knowledge.playbook(program)` reads a SUBFOLDER (`knowledge/dispo/playbook.md`) and REFUSES an empty prompt, because a model handed no identity invents one. `touches.render_deal()` fills `{road} {area} {price}`, deliberately a different function from `render()` so a caller cannot pass a full street address where a road name belongs. Selftest is **167 checks**, up from 143; the new ones assert that the approved price passes, an invented one is blocked, and the seller profile still blocks every price.
+
+```bash
+python src/dispo_buyers.py --phase sweep
+python src/dispo_buyers.py --phase hydrate --workers 4      # ~2.9 req/s, resumable
+python src/dispo_buyers.py --phase aggregate
+python src/dispo_buyers.py --phase unmask                   # FREE principal resolution
+python src/dispo_buyers.py --phase score --commit           # Trestle + dial tiers
+python src/sms_agent/dispo_campaign.py --deal deals/<id>.json          # dry
+python src/sms_agent/dispo_campaign.py --deal deals/<id>.json --queue  # stage HELD
+```
+
+**Buyer profiles (`--phase profiles`, 2026-08-28).** Per-buyer answer to "what does this person actually buy", for the **698 buyers with 2 or more purchases** (the other 3,588 bought once, where a buy box is a guess wearing a range). Output `buyer_profiles.json` plus a 5-sheet workbook (Overview / Buyer Profiles / Call List / By Type / Sources and Caveats). Types: 253 active holders, 219 exited flippers, 111 landlords, 34 self-performers, 20 wholesalers, 10 institutional, 10 not-a-target, and **181 reachable right now**. The one-line narrative per buyer is GENERATED, not modelled: 698 rows of arithmetic is a poor use of a model, and a model asked to summarise a buyer will eventually invent a detail a caller then repeats to that buyer on the phone.
+
+**THE SWEEP HAS NO DATE BOUND, and the profiles are what exposed it.** `extra_last_sale_investor_transaction_type` selects properties whose LAST SALE was an investor transaction, with no time filter, so the observed purchases run **2019 to 2026**, not the 12 months the first narrative template claimed. Measured: only **41% of these buyers bought within the last year** and the **median last purchase is 456 days old**. Every profile now states its own first-to-last year span and carries `active_365d`, `days_since_last` and a `buys_per_year` computed over that buyer's real span. Half this list is dormant, and a deal blast that ignores recency is texting people who stopped buying three years ago.
+
+Three more data traps fixed here, all found by reading the output rather than the code. **A house does not sell for $3,000:** 13 buyers had price bands anchored on $1,000 to $4,594 quitclaims, so `NOMINAL_SALE_FLOOR` (under $10K, or under 20% of the property's value) drops 89 nominal transfers from the bands while keeping them in the purchase count. **Bands are p10 to p90, never min to max**, and a buyer with fewer than 3 priced sales gets a single figure marked thin rather than a fake range. **`_is_human` now requires two tokens and rejects placeholders:** SiftMap returned the literal string `UNKNOWN` as one LLC's mailing-address owner and it passed every entity and firm check, and 301 more "principals" were bare surnames like "Martin" that would have greeted someone by their last name. 305 cleared in total. Also `phase_sweep` originally persisted 8 of ~35 fields and discarded exactly the buy-box dimensions; it now keeps beds, baths, sqft, lot, equity and the investor scores (92 to 100% populated). `yearBuilt` is NOT returned by this endpoint at all, so there is no property-age dimension, and `propertyUse` is constant because the sweep filters single-family.
+
+**RECENCY IS NOW THE GATE (2026-08-28), because the sweep never had a date bound.** `phase_recent` re-runs the same sweep with `extra_last_sale_date_min` (verified by count delta: Knox 6,912 unbounded drops to 1,151 at 12 months while a bogus key returns the unfiltered 6,912) and becomes the qualification layer, while the unbounded sweep stays the history layer. Recency decides WHO is on the list; full history decides WHAT they buy. Cheap by construction: 1,129 properties in the 12-month window and 1,101 were already hydrated, so 28 detail calls, not another 75-minute run. It also surfaced **36 currently-active buyers who were not in the registry at all**, which no amount of re-reading cached data would have found. Cohort is now **active in the last 12 months AND 2+ lifetime purchases = 276 buyers** (154 hot within 182 days, 84 reachable), down from 698. 424 were dropped as no longer buying. Price bands prefer the last 24 months and widen to full history only when that leaves under 3 priced sales, recording `price_basis` on the row (169 recent, 101 widened, 6 with no priced sale) rather than hiding the widen.
+
+**The blast copy, and the five bugs the first live render surfaced (2026-08-31).** Copy is Ty's own text voice: no "Ty here" opener, a bare `-Ty` sign-off, "I saw you were a potential buyer" rather than "I buy and sell a few houses", and the video offered ("if you're interested I can send over the walkthrough video") rather than demanded. Entities get Ty's transparency parenthetical, "Hi Smithbilt team (sorry, couldn't find the signing member)". **The location named is each buyer's OWN city from their deed history**, never the subject's, because we do not actually know the deal is in East Knoxville and claiming it is a lie a buyer can catch. Five bugs, none of which a spot check would have found:
+- **"Real Estate" was read as a trust.** `ESTATE` sat in `_TRUST_TOKENS`, so "Affordable Houses and Real Estate" silently lost both its "team" and its transparency note. ESTATE now counts only when it ENDS the name and is not preceded by REAL, which still catches the "Willis Ailene B Life Est" case it was added for.
+- **An unknown buyer rendered "Hi , I saw...".** `buyer_greeting("", "")` returned `" team"` and every variant opens `Hi {who},`. It now returns nothing and `render_deal` collapses the greeting to a plain "Hi,".
+- **A mailing street carrying a zip held candidates for copy we throw away.** `seed.build` renders SELLER copy first and validates it under the seller profile, which blocks any 5-digit run; the buyer copy that actually ships is rendered afterwards. Two real buyers were held for a zip in a message that never existed.
+- **429s and 502s were read as missing data.** The live client is the shared Deal Room `crm_api.CRMClient`, not `crm_standalone`, and it raises on both. 15 buyers were held as "could not read dial tier from the CRM", which is indistinguishable from an untagged record. Retry now lives at the SiftStack boundary (`crm._transient_wait`), honours the server's own "available in N seconds" hint, and covers whichever client is underneath since we do not own the shared one. A 404 or 400 is still a real answer and is not retried.
+- **The selftest was calling a signature that no longer existed** and aborted the suite with a TypeError instead of failing a check. `render_deal`'s parameter list and `BUYER_POOLS`' shape are now asserted directly.
+
+**THE PRICE BAND IS ASYMMETRIC, because the two directions are different constraints.** Above a buyer's band is AFFORDABILITY: a buyer whose ceiling is $120K cannot close $600K. Below it is only INTEREST: a buyer whose cheapest purchase was $140K can obviously afford a $75K house, they may just not want one that small. A symmetric 0.35 tolerance kept **68 of 199** at a $75,000 ask and dropped buyers purely for being too big, which is the wrong reason to skip anyone. The floor is now divided by `--band-floor-mult` (4x) while the ceiling keeps the tolerance, taking the cohort to **159**. Measured on this cohort at $75K: only 32 buyers have a band that covers the ask outright and **162 have never bought that cheap**, so this deal sits below the market these investors normally play in and the floor rule is doing real work.
+
+**The copy audit runs over EVERY message, not a sample.** Variants are chosen by a hash of the record, so the four messages a sample prints are not the four that ship; three variants once shipped unsigned and only two surfaced in a sample. `dispo_campaign.audit()` asserts on all of them: signs off `-Ty`, never contains the contract price in any spelling ($65,000 / 65,000 / 65k), no em or en dash, no link, no zip, at most one question, under 320 characters, and **names a city that buyer has actually closed in**. A failing audit refuses to stage (exit 3) rather than printing a warning above a staged batch.
+
+**"No institutional buyers" cannot be a keyword rule.** Scanning the 193-buyer cohort for HOMES / BUILDERS / CONSTRUCTION / DEVELOPMENT flags 24 names, and reading their data shows 23 are small local operators: portfolios of 1 to 11 doors on 2 to 18 purchases. A self-performing local builder is the single BEST buyer for a full gut at $75K, so the keyword sweep would delete the target audience in order to catch one name. Exactly the same failure as the earlier `BANK` matching inside `WILLBANKS`. `NAMED_EXCLUSIONS` is instead a list of firms verifiable as production builders, iBuyers or SFR funds (Ball Homes, Clayton, D.R. Horton, Lennar, Opendoor, Offerpad, HomeVestors, Progress, Tricon, Amherst, FirstKey, Truehold and the alias forms from the enterprise-prospects map), each drop logged with the name it matched. On this cohort it removes exactly one buyer, Ball Homes, and keeps all 21 local builders.
+
+**HOW A BUYER IS ADDRESSED went wrong four separate ways, and the copy audit found all of them because it reads every message.** Each came from one real row: a BARE INITIAL is not a first name ("E J E Bourgeois" texted "Hi E,"); `clean_first` is a PERSON rule and on "J A Murphy Group Llc" it reads the surname slot as "Llc" and returns "Murphy", greeting a company as a man; COUNTY RECORDS WRITE LAST FIRST, so "Haddad Amer Michael" is Amer Michael Haddad and token zero is the surname; and a person we cannot name must get NO addressee rather than falling through to the entity branch, which produced "Hi Haddad Amer Michael team," and "Hi William David Faulkner Sr team,". The entity path has an oracle for the last-first problem (the company name) and a bare person name has none, so a person name of 3 or more tokens is treated as ambiguous and gets a plain "Hi,". That costs a correct "William" on one row to avoid a wrong "Haddad" on another, which is the right trade in a cold text: no name reads fine, the wrong name reads like a list. The registry's own `is_entity` also missed "Maker Building Co", so `_entity` is the OR of that flag and `touches.is_entity`, and it now decides whether a buyer can be called a team at all. Final split on 192: 188 entities, 2 first names, 2 with no addressee.
+
+**THE SENDER IS FORCED, not defaulted.** `seed._resolve_sender` reads the record's CRM assignee FIRST and treats `SMS_AGENT_SENDER_NAME` as a mere fallback, so the single record in 156 that carried an assignee signed as the acquisitions prospector. On a dispo blast that is wrong twice: it is not Ty's deal voice, and a callback reaches someone who knows nothing about the property. `rows_from_registry(sender=)` pins `assigned` on every row, which uses the existing mechanism instead of special-casing seed.py, and `audit()` checks the sign-off against the chosen sender rather than a hardcoded "-Ty".
+
+**THE DRY RUN WAS WRITING, AND NOTHING STOPPED A SECOND COPY.** Staging the batch twice left **312 held rows for 156 buyers**, and released that would have texted every one of them twice, which is the worst thing a cold number can do. Two independent causes, both silent: `SMS_AGENT_DRY_RUN` never reached `seed.queue` at all (it gates sends and CRM writes, so a dry run reported itself as a dry run while writing the whole batch to the local outbox), and `store.queue_message` is a plain INSERT while the duplicate check in `build()` only sees the CURRENT batch, so it cannot know about one staged an hour earlier. `queue()` now returns early under DRY_RUN and skips any phone that already has a `held` or `queued` row, returning a `duplicates` count so a caller cannot report more than it staged. Both are regression-tested. The selftest itself runs under DRY_RUN, so its staging tests opt out explicitly on their throwaway DB, which is the honest fix rather than weakening the guard.
+
+**Copy says "we have a property on {road}" and names the redaction out loud** (Ty, 2026-08-31). "I've got one on Old State Rd" reads as though that IS the address, so a buyer either believes it or reads us as cagey. Every touch-1 and touch-2 variant now carries an explicit cue ("Holding the exact address for now", "Keeping the full address off text", "Not posting the exact address here"), which tells a real investor there is a real house and that the address comes with the conversation. `audit()` enforces the cue on every rendered message; touch 3 is the breakup and pivots to what else they want, so it carries the road but not the cue.
+
+**Slack routing is per program.** `SMS_AGENT_DISPO_SLACK_WEBHOOK` carries buyer traffic and falls back to the seller webhook with a warning rather than going silent. A single webhook would have put "a price just went out to 156 buyers" in the seller text-leads channel. `escalate._post(program=)` does the routing and the selftest stub records the program, so posting dispo traffic to the seller channel is now a visible regression.
+
+**THE SENDING NUMBERS WERE NOT REAL, AND THE REFRESH THAT WOULD HAVE CAUGHT IT WAS EXCLUDING THEM.** Every dry run and staging pass in this session used five numbers carried forward in a shell variable that **do not exist in the smrtPhone account**; a live pull of the number grid shows 25 numbers and none of them are among the five. The sends would simply have failed. The check that should have caught this had been disabled by accident: `numbers_sync.EXCLUDE_PATTERNS` carried a `dispo` rule from when the only "Dispo" line was Ty's personal test number, so once real dispo numbers were bought the refresh silently dropped the entire pool and reported a healthy "19 numbers", which looks exactly like not having bought them. Dispo is now a pool keyed on the NUMBER'S NAME and checked before the exclusions, because all five sit on a routing flow named "Ty Test" and the generic test rule would drop them. Live refresh: Adriana 19 + Dispo 5. **The live pool lives in `config/sms_numbers.json`, which is gitignored; this file is public, so the DIDs are deliberately not written here.** Re-derive them any time with `cli.py numbers --refresh`, which reads smrtPhone directly and is the only source that cannot go stale.
+
+**THE POOL FELL BACK TO THE SELLER NUMBERS, which is the expensive version of the same class of bug.** `sender_pool.pool()` returns EVERY number in the account when the owner has no pool of their own, and the dispo sender is "Ty", who has none. A staged batch duly spread 156 messages across all 24 numbers including Adriana's 19 acquisitions lines. Three things break at once: the 10DLC per-number cap is counted per database so the seller program's budget is spent invisibly, one number carries two programs, and a buyer who calls back rings the acquisitions flow. `set_forced_pool()` pins a program to one pool and a pinned pool that is missing returns NOTHING rather than falling back, because no numbers is a loud failure and the seller pool is a silent one. Stickiness is also pinned: 89% of these buyers were already in the seller marketing ecosystem, so their sticky number is often Adriana's, and a dispo text signed `-Ty` arriving from the acquisitions number is worse than a number change.
+
+**The dispo numbers ring the "Ty Test" flow BY DESIGN** (Ty, 2026-08-31). It looked like a misconfiguration and was raised as blocking; it is not. Dispo callbacks are meant to reach Ty exclusively, while the prospecting side stays under Adriana. The number pool is grouped by flow for everyone else because the flow is what a callback rings, so the dispo lane is keyed on the number's NAME instead.
+
+**FLY SECRETS OVERRIDE `fly.toml` `[env]`, and reading the file told the opposite of the truth.** `fly.toml` says `SMS_AGENT_DRY_RUN = "1"` and `SMS_AGENT_PHASE = "1"`, and both are also set as SECRETS with the opposite values, so the live box runs `phase=2, dry_run=false` and has been sending for real (1,619 sent, 92 failed, 73 cancelled). `fly config env` shows only the `[env]` block, so it confirms the wrong answer. **Ask the running system: `curl https://siftstack.fly.dev/health` reports the effective phase and dry-run, and `fly ssh console -C "printenv"` shows what the process actually has.** On that box a release SENDS; there is no dry-run gate standing between a staged batch and 156 real texts.
+
+**`SMRTPHONE_NUMBERS` (a secret) also outranks `/data/sms_numbers.json`**, so uploading the file with the new Dispo pool changed nothing and `sender_pool` correctly refused to fall back, reporting "pinned pool 'Dispo' does not exist". The supported path is `cli.py numbers --push | fly secrets import`. Live pools are now Dispo 5 and Adriana 19.
+
+**Caps: dispo runs at 60 per number, acquisitions stays at 25** (Ty: these go to buyers, not sellers, and the whole blast has to land in one day). That is 300/day of dispo capacity against a 156-message blast. `SMS_AGENT_POOL_CAPS` carries it per pool so the two programs never share a carrier-risk setting.
+
+**THE REPLY PATH COULD NOT TELL A BUYER THREAD FROM A SELLER THREAD, so every piece of buyer machinery was unreachable.** `respond.validate(program=)`, the dispo playbook subfolder and `_deal_facts_block` all existed and were tested; NOTHING in the live path passed `program`, and `engine.py` and `worker.py` contained not one reference to it. A buyer answering "how much?" would have been handled by the SELLER playbook ("never name a dollar amount"), validated under the SELLER profile which blocks every dollar figure so the approved asking price could never be quoted, and a hot BUYER lead would have paged the seller Slack channel rather than the dispo one. The signal is **the number the reply arrived ON**: the pools are disjoint by construction, so `sender_pool.program_for(to_number)` decides it with no schema change and nothing to keep in sync, and an unknown number falls back to seller, never buyer. It is threaded to `respond.draft`, the playbook, and `escalate.hot_lead`, which the WORKER posts after a debounce, so the worker re-derives it from the conversation's own `from_number`.
+
+**The responder also had no deal.** `seed.queue` records owner facts only, so the dispo agent's facts block carried no price, road or specs and the price whitelist had nothing to authorize. `dispo_campaign` now writes the deal onto each thread's phone-map context after queueing.
+
+**A KILLED OR DROPPED RUN LEAVES A PARTIAL BATCH.** Stopping the broken band-less run left **34 rows already queued**, precisely the out-of-band buyers it should never have staged, and the Fly outbox read 190 held instead of 156. Separately, `fly ssh console` dropped a 20-minute staging run mid-flight ("remote command exited without exit status"). Stage detached on the box (`nohup ... > /data/stage.log`) and poll the log, and ALWAYS read the held count back before trusting a batch.
+
+**`SMS_AGENT_DRY_RUN` and `SMS_AGENT_PHASE` are APP-WIDE, not per program.** Flipping either to take dispo live also takes the seller agent out of dry run and up a phase in the same step, which is almost certainly not intended and is an argument for a separate Fly app for dispo.
+
+**PRODUCTION IS THE FLY BOX, NOT THIS WORKSTATION, and the blast was staged in the wrong database.** `siftstack` on Fly holds `/data/sms_agent.db` with 1,784 outbox rows, 775 conversations and 3,667 phone maps; the local `output/sms_agent/sms_agent.db` has 609 / 763 / 3,332. Fly is where smrtPhone posts inbound texts. Releasing a locally staged batch would therefore send the texts and then lose every reply: the Fly receiver has no phone map for those buyers, so answers arrive as unknown numbers and never join a thread. Money spent, interest dropped, silently. The campaign inputs (`registry.json`, `buyer_profiles.json`, `phones.json`, `phone_scores.json`, about 5MB) have to live on the volume and the staging has to happen there, so one system owns both sending and replies. Two further gates are deliberate and are Ty's to flip, not code defaults: Fly runs `SMS_AGENT_DRY_RUN=1` (fly.toml says "flip to 0 only after a watched live send") and `SMS_AGENT_PHASE=1`, which classifies replies but never escalates, while the buyer handoff needs phase 2 or higher.
+
+**The launch notice said "is sending" when nothing had been sent.** It fires at STAGE time, so a channel of humans read that 156 texts had gone out. It now reads "STAGED (nothing sent yet)" and names the release step as the only thing that sends. A safety notice that misstates what happened is worse than no notice, because it spends the credibility that makes people read the next one.
+
+
+**STAGED AND WAITING ON A HUMAN (158 Old State Road, 2026-08-31).** 192 buyers to 158 in band to **156 held in the outbox**, 156 distinct phones so nobody is double-texted, spread 29 to 32 across the five dispo numbers (cap 60). 155 send today between 12:20pm and 5:59pm Eastern; the 156th tipped past the 6pm business cutoff and lands 9:03am tomorrow, which is the window working, not a fault. Verified by reading the DATABASE rather than the render path: every body signs `-Ty`, says "we have a property on Old State Road", carries the address-held-back cue, and quotes $75,000; none contains the $65,000 contract price in any spelling; none carries a link, zip or dash; longest is 308 characters. Nothing has been sent: `release` is the go/no-go and it is Ty's call.
+
+```bash
+python src/sms_agent/cli.py release --touch 1     # the irreversible step
+```
+
+**The launch notice is not wired yet and that is a real gap, not a cosmetic one.** `notify_staged` posts "a price just went out to 156 people", which is how a wrong road or a wrong figure gets caught in minutes rather than from a reply. The only configured webhook belongs to the seller text-leads channel, so it was suppressed for staging rather than fired at the wrong audience. The dispo channel id alone cannot be used: verified live, the Slack connector available here is installed on a different workspace and returns `channel_not_found` for it, so an incoming webhook URL for that channel is the unblock.
+
+
+
+
+
+**THE `rental` LABEL LAGS BY OVER A YEAR, and it nearly deleted every landlord.** Measured: `rental` returns 1,930 properties in Knox unbounded, 17 at 18 months and **ZERO at 12 months** (Blount 511 / 4 / 0). SiftMap cannot classify a purchase as a rental until it observes the property being rented, so a recent buy-and-hold sits under `pending`. The old buyer-type rule required `txn_types == {"rental"}` exactly, so the moment recency entered the picture **111 landlords became 0** and reappeared mislabelled as active holders. The rule is now "any rental history AND holds at least as many as it exits", which restored 115. Related ordering fix: `wholesale`/`wholetail` describe how a buyer ACQUIRED, not their model, so that label now only fires when nothing about holding or exiting did.
+
+**A BUSINESSV2 PRINCIPAL CANNOT BE SKIP TRACED AT THE COMPANY'S ADDRESS.** SmartSkip matches First + Last + Mailing Address, and a `siftmap-reverse-address` principal satisfies that BY CONSTRUCTION, since we found that person living at that address. An officer lifted from a corporate filing has no established link to it. Measured across two real batches: reverse-address principals hit **163 of 172 (95%)**, BusinessV2 principals hit **1 of 26 (4%)**. They are now held out of the SmartSkip batch by default (`--trace-businessv2` overrides) and need a name plus city/state person search instead. Cost of learning this was about $0.30 because the batch was small, which is the argument for small batches. Two more guards added at the same time: `skipinput` refuses to re-buy a number we already own (92 of 130 rows on the first pruned run were already-traced people, a silent double charge), and `phase_phones` now builds its join bridge from the REGISTRY and merges every downloaded batch, because the input CSV is regenerated on each run and an older download loses its bridge the moment the cohort changes.
+
+**BUSINESSV2 CANNOT BE CONSTRAINED GEOGRAPHICALLY, AND MOST OF WHAT IT RETURNS IS THE WRONG COMPANY.** Verified live 2026-08-28: searching `SMITHBILT LLC` with no anchor, with `Addresses[{AddressLine2: "Knoxville, TN"}]`, and with `Addresses[{State: "TN"}]` returns byte-identical results. It fuzzy-matches company names nationally, and `extract_officers` accepts any filing containing the entity's first token, so a Knoxville LLC resolves to officers of a same-named company in another state: GDP Properties to West Point IA, Smithbilt to Hagerstown MD, Knox Development to Montrose SD, Vanguard Investments to Saint Albans VT. Measured on 12 cohort entities, only **2 had any Tennessee officer**. The first pass therefore put roughly 25 out-of-state strangers into the workbook as buyer names. The officer's own `address.fullAddress` is the ONLY geographic control available, and it is only available because `extract_officers` returns it: `rank_officers()` now drops any officer outside the buyer's own state, which resolved **29 of 153 (19%)** and cleared **62 unverifiable names**. An out-of-state officer is not a weaker answer, it is a different person.
+
+**The same pass fixed the 4% skip-trace rate, and the cause was an address FORMAT.** SmartSkip matches First + Last + Mailing Address, and a BusinessV2 principal was being matched against the COMPANY's address, which is why those rows hit 1 of 26 while reverse-address principals hit 163 of 172. Tracing the officer's own address instead lifted it to **17 of 22 (77%)**. It took two attempts because Enformion writes `"4300 Hiawatha; Knoxville, TN 37919"` with a **SEMICOLON** before the city while SiftMap uses a comma, so `split_mail` glued the city onto the street and left Mailing City empty; the first paid batch came back with every result column blank. The semicolon now takes precedence over commas, since the street itself can contain a comma (`"2099 Thunderhead, Ste 204; Knoxville"`).
+
+**Two of my own bugs in this pass are worth remembering, because both reported as findings about the data.** A `` word boundary written through a shell heredoc reached the file as a literal **backspace byte** (``), so the state filter matched nothing and the run announced "0 of 153 verified" as though BusinessV2 had failed; the check is now backslash-free tokenization (`"".join(c if c.isalnum() else " " for c in addr).split()`) because there is no escaping to get wrong. And `phase_phones` built its join bridge only from the company mailing address, so 17 newly bought hits silently failed to attach; it now indexes BOTH candidate addresses plus an unambiguous name-only fallback, which recovered 68 records.
+
+**Coverage after the pass: 84 to 99 reachable of 268 targets**, with 222 buyers now carrying phones and 200 of those having a Dial First or Second number. Well short of the ~170 projected, because that projection assumed BusinessV2 would verify at close to 100% rather than 19%. The residue is honest and on the Overview sheet: 44 entities where BusinessV2 found no human officer at all, 71 where it found officers but none in the buyer's state, 29 where a principal resolved but the trace missed, 11 untraced people. Agent-titled principals are traced as a FALLBACK per Ty but carry a `VERIFY` flag on both the Buyer Profiles and Call List sheets (25 rows), because a caller who assumes they have the owner will open wrong on a lawyer's line. Also added: `write_profiles_xlsx` writes to a `_PENDING_` name and swaps, since Excel holds an exclusive lock and saving over an open workbook otherwise loses the whole run.
+
+**THE NUMBERS WERE ALREADY IN THE ACCOUNT, AND A COMMENT STOPPED US LOOKING.** `dispo_flip_buyers.py` carries the line "person-owned records are skipped by default because DataSift's native unlimited skip trace covers humans; the entity principal is the part it cannot do". That was inherited as established and never measured. It is wrong: DataSift skip traces ENTITY-owned records too. Measured 2026-08-28 across the 128 unreachable target buyers holding a CRM record, **107 already carried phones** (514 rows, 316 unique mobiles) on records whose owner is the LLC itself, with GDP Properties on 9 numbers, Vanguard 7, Smithbilt 6. Only **2** had ever been Trestle scored. `--phase crm-phones` reads `owner.phones` off each record and merges it, and the whole harvest costs nothing because the account already paid for it under the unlimited plan.
+
+**Coverage went 99 to 205 of 268 targets for $12.34 of Trestle scoring**, against roughly $105 already spent on Enformion and SmartSkip chasing identities. That vendor spend is not wasted, it answers a different question: the CRM yields NUMBERS with no person attached (the record owner is the company), while Enformion yields a NAME. Texting works from numbers alone because the buyer copy has no-name variants; calling needs the name so the caller knows who to ask for. Both columns are on the sheet now (`Phone source`, `Name known?`, and `ASK WHO` on the Call List). The residue is 33 buyers with no CRM record to harvest, 21 whose record held no usable number, and 15 whose numbers all scored too low.
+
+Three rails on the harvest: an existing phone **disposition outranks it** (DNC, CORRECT_DNC, WRONG_DNC, WRONG and DEAD are skipped exactly as `seed.SKIP_PHONE_STATUSES` does, so nothing set by hand is overwritten); numbers **merge rather than overwrite**, so a number SmartSkip already returned keeps its place and gains a second source; and a live read-back asserted that **every harvested number is present on its source CRM record**, zero invented.
+
+**The rule this build keeps re-learning: an assertion in a comment is not a measurement.** The same session also shipped a `` word boundary through a shell heredoc that reached the file as a literal backspace byte and made a state filter match nothing, which the run then reported as "0 of 153 verified" as though it were a finding about the data. Check what the account already holds before buying, and probe a filter with a count delta before trusting what it says.
+
+**Open:** dedicated dispo DIDs are still unbought, so a blast shares the 18-number seller pool (450/day) and the pools must be disjoint before going live, since per-number caps are counted per database. Threads currently sign as **Adriana** because the dispo records' `assigned_to` resolves to her; the dispo program wants its own sender identity. The cross-program collision check (a buyer who is also an open seller lead) is designed but not yet built, and it matters because 89% of pending-flip owners were already in the marketing ecosystem.
+
+## Dispo Blast, Live: two deals, two shapes (build 1.0.51, 2026-09-03)
+
+The dispo program went from staged to sold. **158 Old State Rd**: 156 of 156
+delivered, **25 replies (16.0%)**, one offer, **full ask $75,000** from Chabella
+LLC against a $65,000 contract, so a $10,000 assignment. **3014 Sanland Ave**
+at $104,000 (contract $92,000): 159 sent in one day, and the first response was
+a **phone call from Litton Properties 12 minutes after their text**.
+
+**The two blasts deliberately have opposite copy, and that is the finding.**
+Blast 1 WITHHELD the address and let the offer do the redacting, so "send me
+the address" became the call to action: 14 of the 25 repliers asked for exactly
+that. Blast 2 leads WITH the full address, price and specs and offers the
+lockbox. Reply rate fell and the first contact arrived as a CALL instead of a
+text. Withholding buys conversation; disclosing buys showings. Watch lockbox
+requests, not raw replies, when the address is public.
+
+`disclose_address` is a per-deal opt-in and the four guards INVERT rather than
+disappear: a redacted deal still refuses a house number and a zip, an
+address-forward deal REQUIRES both, `audit()` asserts the exact address is
+present, and `_deal_facts_block` includes it only when disclosing. **The lockbox
+code is never in the deal sheet at all**, so the agent can offer it and cannot
+give it; that code is physical access to a house.
+
+**The money check is a WHITELIST, not a blocklist.** Every money-looking token
+in a message must equal the approved asking price. That catches an invented
+number AND the contract price without the audit ever being told what the
+contract price is, which is why `deals/3014-sanland.json` carries no
+`contract_price` field. Written without a regex on purpose, after a `` escape
+reached a file through a shell heredoc as a literal backspace byte for the third
+time in one session.
+
+**Never imply a price relationship that is not true** (Ty, 2026-09-02). "Another
+one at this price" on a $104,000 deal, to people who saw $75,000, is a factual
+claim a buyer can catch. The warm variant references the RELATIONSHIP instead
+("since you looked at the last one").
+
+**A NEW DEAL may reopen a thread a human paused, but never an opt-out.** The
+takeover pause is per conversation and meant the last property; on blast 2 it
+held all 16 buyers who had engaged on blast 1, excluding the most valuable
+audience precisely because they had been good leads. `seed.build(new_deal=True)`
+allows `paused` and never `opted_out`, and `queue` reactivates the thread, since
+otherwise the text goes out and the reply lands on a paused conversation where
+it is never classified.
+
+**`dispo_phonebook` turns a finished blast into an asset.** The engine already
+sets phone status CORRECT with a Dial First tag when someone engages, so
+verified-number capture is free; what was missing is grouping and a summary a
+caller can read. Classification comes from what people actually typed: 16
+verified, 131 silent, 9 suppressed (3 opt-out, 3 wrong number, 3 hard no).
+**Scope it to the sending pool** or an unscoped pass classifies 947 recipients
+across both programs and suppresses seller numbers as a side effect of a dispo
+cleanup.
+
+**Operational lessons that cost real time:**
+- **Fly SECRETS override `fly.toml` `[env]`.** `fly config env` shows the file
+  and confirms the wrong answer. Ask the running system: `/health` reports the
+  effective phase and dry-run. The box was live at phase 2 the whole time.
+- **`nohup` does not survive `fly ssh console`.** Use `setsid`; Fly kills the
+  process group on hangup. A long run also drops mid-flight, so stage detached
+  and poll the DATABASE, never the command's exit.
+- **A probe whose pattern appears in its own command line always matches
+  itself.** Searching `/proc` for `*dispo_campaign*` from a shell whose own
+  cmdline contained that string reported a dead job as alive for twenty
+  minutes. List the processes and read them instead.
+- **A killed run leaves a partial batch.** Stopping the band-less run left 34
+  already-queued rows, exactly the out-of-band buyers. Always read the held
+  count back.
+- **Carrier registration is invisible to tests.** 262 passing checks cannot know
+  four of five numbers were unregistered for A2P 10DLC. Canary one message per
+  number and read the result.
+
+**Shipped public (2026-09-03).** Four agents added to the org chart under Dispo
+& Buyers (`dispobuyers`, `dispoblast`, `dispobook`, `dispoflow`) plus updates to
+`sender`, `classifier` and `responder`; `docs/AGENT-MAP.md` and
+`docs/agent-system.html` regenerate from `docs/agents.json` and publish at
+learn.datasift.ai/agent-org-chart. New community skill **`dispo-deal-blast`**
+(tier none, 27 packages in the manifest) carrying the method and every guard.
+
+**Two things the CI gates caught that a review would not.** A `.skill` archive
+has no diff, so drift between what people download and what they can read is
+invisible: `dist/playbook-creator.skill` was stale, and separately its
+description was 1,154 characters against a hard 1,024 limit that makes Claude
+Code reject the WHOLE package at install time, after the download. Both were
+inherited, both are fixed. The drift itself was **line endings**: the archive is
+zipped from the WORKING TREE, `.gitattributes` normalises on checkout and add
+but never rewrites a file already sitting there with CRLF, so
+`git add --renormalize .` is the command that actually makes them match.
+
+**Never commit this repo blind; it is PUBLIC.** The sweep for this session found
+a SmartSkip session file holding live access and refresh tokens, county eviction
+records naming tenants and their court dates, vendor webpack bundles saved while
+reverse-engineering filter keys, and a 39MB screen recording carrying seller
+data. All now gitignored. The sending DIDs were also removed from this file and
+replaced with a pointer to the gitignored pool.
+
+## Contractor Research Workflow (build 1.0.47, 2026-08-20)
+
+The team's contractor/sub sourcing method, imported from the Desktop Contractor-Research-Toolkit and registered as two community-safe skills: `skills/vendor-directory-builder/` (research engine: community mining -> public-record verification -> geo sweep + gap analysis + niche gatekeeper layer -> Excel via `scripts/build_directory.py`) and `skills/contractor-call-sheet/` (action layer: printable call sheet via `scripts/build_call_sheet.py` + personalized outreach drafts, never sends). Both tier none (pure openpyxl), category Operations, on the agent map under Deal Analysis (`vendordir`, `callsheet`). Internal SOP with the real Knox+Blount worked example (68 providers): `docs/contractor-research-workflow.md`.
+
+**Rules that make it work:** never fabricate a field (unverifiable = "not found" / UNVERIFIED, someone will dial these numbers); cross-validation (2+ independent recommenders) is the call-first signal; service area is the most common silent failure (the geo sweep removed 5 of the first Knox list); ratings always carry the review COUNT; found/AI-generated lists are claims to verify, and catching their wrong numbers IS the deliverable. The distributed bundles carry fictional example data and [Your Company]/[Your Name] placeholders; the real provider data stays in the internal doc and the Desktop toolkit. Community page (learn.datasift.ai/claude-skills-rei) listing is still a follow-up.
+
+## Playbook Creator v2 + Agent SOP Infrastructure (build 1.0.48, 2026-08-21)
+
+The playbook-creator skill was overhauled into a three-format documentation engine modeled on two open-source systems researched for the build: **strands-agents/agent-sop** (the Agent SOPs standard: markdown SOPs an agent executes directly) and **westpoint-io/mimik** (an MIT Scribe clone; its export format defines our step-guide shape). Formats: **SOP** (human Word doc + agent-executable `.sop.md` twin), **Playbook** (strategy, unchanged), **Step Guide** (Scribe style: title under 60 chars, `N steps · Created date · Source` metadata line, zero-padded `## Step 01:` action-verb headings, one screenshot per step).
+
+**The `.sop.md` twin contract (Agent SOPs standard):** four structural invariants: kebab-case filename ending `.sop.md`; `## Overview` (2-4 self-contained sentences, doubles as the description in every distribution channel); `## Parameters` (snake_case, required first, mandatory `**Constraints for parameter acquisition:**` block); `## Steps` as `### N. Name` headings each carrying `**Constraints:**` in RFC 2119 (You MUST / SHOULD / MAY). Every negative constraint carries a because; every producing step names its artifact path (the resumability story). Validator: `skills/playbook-creator/scripts/validate_sop.py` (stdlib port of the strands checks), run after EVERY edit. The human SOP's Inputs table and the twin's Parameters share names so the pair cannot drift.
+
+**Team SOP library + MCP serving:** twins live in `sops/` (see its README for house rules). The project `.mcp.json` runs `python -m strands_agents_sops mcp --sop-paths sops` (pip `strands-agents-sops`, in the repo venv), so every file there is a Claude Code slash prompt (`/agent-sops:<name>`) that asks for its parameters and runs the steps. Smoke-tested over real MCP JSON-RPC. Windows note: `--sop-paths` separates with `;` on Windows, `:` on Unix.
+
+**The video pipeline is the flagship input path (proven on the real "Remove Sold Properties" walkthrough, 8.3 min, 2026-08-21).** A narrated screen recording replaces both the transcript AND the screenshots: `scripts/transcribe_video.py` (bundled, stdlib) extracts audio via ffmpeg, transcribes through OpenRouter Gemini 2.5 Flash (`OPENROUTER_API_KEY`, ~$0.002/audio-min, the whole video cost ~2 cents), and returns three sections: TRANSCRIPT (timestamped), ACTIONS (every UI action with the exact label spoken), JUDGMENT (every decision rule stated aloud, which become the SOP's Rules and the twin's MUST NOTs). `--frames-dir` then pulls a frame per action timestamp: **the frames ARE the screenshots**. Gotchas learned live: transcription clocks drift (first pass read 9:27 on an 8:15 video; the script scales stated time onto ffprobe-real time), frames can catch a page mid-load, so every frame is VERIFIED visually before embedding and near-duplicates dropped; `--crop 1920:910:0:125` removes 1080p Chrome chrome+taskbar. No-key fallback: paste the recorder's own free transcript (Loom/Zoom/Fireflies). The key is OPTIONAL and the skill stays tier none.
+
+**`build_docx.js` now embeds real screenshots:** a standalone markdown image line (local path or base64 data URI) lands in the Word doc at content width, alt text as caption, missing file degrades to a visible placeholder instead of breaking the build. That closes the loop: capture-tool exports and video frames flow straight to a finished doc. Screenshot placeholders were upgraded to Scribe-style capture specs (Capture / Highlight / Crop, exactly one highlighted element per shot).
+
+**First production run:** `output/sops/sold-property-removal/` (13-step Word doc, 13 real frames + process map) and `sops/remove-sold-properties-from-marketing.sop.md` (validated twin, parameterized county/price_floor/years_back). The process itself: sequence `recently sold` tag -> status Sold (Transactions folder), SiftMap county filter at $1,000+ / 3-year window, backlog pulled 10K at a time WITH the tag and auto-add OFF, auto-add ON only after the backlog lands, verify next-day auto-upload arrives at status Sold. Frames carry real seller data + Ty's webcam bubble: fine internally, blur before community distribution.
+
+## Enterprise Prospect Pipeline (build 1.0.46, 2026-08-19)
+
+`src/enterprise_prospects.py` builds the DataSift SALES team's enterprise outbound list: the top property BUYERS nationwide, researched and tiered as prospects to sell DataSift enterprise contracts to. Phases `audit/classify/probe/sweep/rank/verify/queue/merge/export/qa`, state in `output/enterprise_prospects/state.json`, every phase gates on nonzero data and is resumable. Read-only against SiftMap; it must NEVER call `add-properties-by-query` (spends record allowance).
+
+```bash
+python src/enterprise_prospects.py --phase audit          # seed CSV -> 52,634 unique buyers
+python src/enterprise_prospects.py --phase probe          # verify the SiftMap search contract live
+python src/enterprise_prospects.py --phase sweep --counties 60 --hydrate-cap 150 --workers 4 --resume
+python src/enterprise_prospects.py --phase qa             # full gate table
+```
+
+**Deliverable (2026-08-19): `output/enterprise_prospects/DataSift_Enterprise_Prospects_20260819.xlsx`.** 9 sheets: exec summary, Top 250 Master, Tier 1 Core ICP (156 independent wholesalers/flippers/landlords, 10-99 buys/6mo), Tier 2 Institutional D2S (31: Opendoor, Offerpad, HomeGo, Truehold, JWB, HomeVestors franchisees), Tier 3 Wholesale-Channel SFR funds (63, kept with a dispo-angle note), 1,000-buyer scored second-tier pool, Knox depth layer (398 buyers from the cached zip sweeps), exclusions log, methodology. 71 targets carry a confirmed direct-to-seller verdict, 138 a named principal.
+
+**Seed = `nationwide_buyers.csv`** (84,048 buyer x county rows; canonical copy under `Skills for REI/extracted/.../buyer-prospector/data/`, the `skills/` copy differs only in line endings). Two data traps, both handled in `audit`: BuyerCity/BuyerState VALUES are swapped vs their headers (detected empirically, 100% two-letter codes in the city column), and `BuyerPurchases6MSum` is a REGIONAL total repeated on every county row, so volume = max-per-name + county-row-count, never a sum (summing gave Opendoor 442K "purchases").
+
+**The SiftMap /properties/search/ contract (all verified live 2026-08-19, most fail SILENTLY if wrong):**
+- The **Open API key works on the bulk search endpoint** (`authorization: Api-Key`), not just detail/autocomplete. No Bearer JWT needed.
+- **`result_index` is a ROW OFFSET, not a page number.** Pages of 250 are result_index 1, 251, 501, ...; passing 1,2,3 returns 99.6% duplicate rows and reads exactly like broken pagination. Ordering is stable.
+- `extra_last_sale_date_min/max` filter for real (Knox 188,010 -> 3,943 sold in 183 days). **`extra_last_sale_price_min` is silently IGNORED** (a $10M floor changed nothing), as are guessed keys like `corporate_owned`. Count-delta is the only proof.
+- Search rows carry **NO owner name** but DO carry `id` (dataflik_id), `corporateOwned` (~15.6% of recent solds), `absenteeOwner`, value/equity/scores/distressors. So the sweep paginates each county's solds, keeps corporate-owned rows, and hydrates a capped random sample per county via `get_detail` for `sale_history[0].buyer_name` - the current owner of a recently sold property IS the buyer.
+- **Detail-endpoint throughput caps near 2-4 req/s AGGREGATE regardless of worker count**, with escalating Retry-After under sustained load (1s -> 16s -> 22s). The 60-county sweep (2,317 search + 7,789 detail calls, 7,069 fresh corporate buyers, 0 empty counties) took ~3 hours; budget accordingly and use `--resume`.
+
+**Classification polarity is INVERTED from `export_buyer_list.py`** (there institutions are excluded from a wholesale buyer list; here high volume is the signal and there is no volume auto-exclude). New taxonomy in-script: EXCLUDE groups (government, GSE/bank/servicer, homebuilder, relocation, title, estate/nonprofit, land dev; HIGH keywords drop outright, MED generics go to REVIEW near the cutline), Tier 1 core ICP, Tier 2 institutional direct-to-seller, Tier 3 SFR funds (structural patterns: `BORROWER .* LP`, `OWNER [IVX]+ LLC`, `\bSFR\b`, acquisition trusts).
+
+**Research fan-out: rules guess, research decides.** All 500 top-ranked targets were researched by 21 parallel web agents in 2 waves (spec at `output/enterprise_prospects/research/RESEARCH_SPEC.md`, schema-fixed JSON per batch). **Measured exclusion rate in the top 200 by raw volume: 44%** (builders, lender/servicer REO takebacks, land bankers, relocation nominees, MHC operators, one university), so always over-select ~2x for attrition. Research overrode the rule tier on 286 of 500. Alias map proven by research (SEC filings, SOS records, shared-suite address matches): OP SPE * = **Offerpad** (NOT Opendoor), ARMM/MSR = Amherst/Main Street Renewal, FKH SFR = FirstKey (Cerberus), SFR JV-* = Tricon, DFH * = Dream Finders, CPT-ASL = Truehold, Hoose 18 = JWB, FREO = Progress Residential, CMH = Clayton.
+
+**`verify` = the Harper move at list scale:** autocomplete the buyer's mailing address (strip `STE/UNIT/#...` suffixes first - suites return zero hits), house-number match, `get_detail` -> `owner_info` portfolio + reverse-address principal. A reverse-address owner only counts as a human principal if it matches no ORG word (`ORG_RX`); "State Bank Of Geneva" and "Us Postal Svc" both slipped the narrow entity regex before that guard. 373/500 resolved, 90 principals unmasked, every miss carries an explicit reason.
+
+**Open item (deferred by Ty): the paid contact-resolution pass** - Enformion BusinessV2 principals + skip trace on the final 250. The workbook's Phone/Email columns are headered "(Enformion pass pending)" and the merge/export phases re-run cleanly once contacts exist.
+
+## Sphere of Influence Pipeline (Columbus OH beta, build 1.0.43, 2026-08-14)
+
+Reverse-searches a realtor's exported Facebook/LinkedIn contacts (name + email ONLY, no addresses) into a Realtor-AI-scored priority list. Built for a Columbus OH realtor partner; the architecture is metro-agnostic. Chain: `soi_intake` (normalize/dedupe) -> `soi_county_pull` + `soi_owner_db` (free county owner rolls -> SQLite) -> `soi_owner_match` (name join) -> `soi_enformion` (paid resolve for misses) -> `soi_enrich` (SiftMap detail + `realtor_score`). First live run: 848 raw rows -> 728 unique people -> 222 confirmed metro homeowners -> 191 scored.
+
+```bash
+python src/soi_intake.py                                   # exports -> output/soi_contacts_normalized.csv/.json
+python src/soi_county_pull.py                              # 4 ArcGIS counties -> output/soi/raw/*.jsonl
+python src/soi_owner_db.py                                 # all 6 counties -> output/soi/owners.db (811K rows)
+python src/soi_owner_match.py                              # name join -> output/soi_owner_matches.csv/.json
+python src/soi_enformion.py                                # PAID (~$0.10/match) resolve of status=none
+python src/soi_enrich.py                                   # SiftMap realtor_score on unique matches
+python src/soi_enrich.py --matches output/soi_recovered_matches.json --out output/soi_enriched_recovered
+```
+
+**The whole Columbus metro is FREE data: 811,146 owner rows across six counties, $0.** Franklin (484K) from the open file server `apps.franklincountyauditor.com` - use `/Parcel_CSV/{yyyy}/{mm}/Parcel.csv` which carries NAME1/2/3 + MAILAD1-4 + values + TRANDT/PRICE; **the newer-looking `Outside_User_Files` Tab-Delimited appraisal extract has NO owner fields at all** (its Parcel.txt is values/situs only), and **the Parcel_CSV folder path is stale on purpose** (latest folder said 2025/07 but the file's Last-Modified was 3 days old - check the header, not the path). Fairfield (76K) from the nightly full CAMA dump `share.pivotpoint.us/oh/fairfield/cama/fairfieldaa407.zip` (iasWorld OWNDAT/PARDAT/APRVAL/DWELL, join on PARID, filter DEACTIVAT). Delaware/Licking/Pickaway/Union (250K) from open ArcGIS layers (endpoints + field maps in `soi_county_pull.py`; Licking serves 100K rows per call and inlines the last 3 transfers). The vendor SEARCH UIs (Schneider Beacon, DEVNET Pivot) are bot-walled and never needed. Ohio's statewide OGRIP parcel layer strips owner fields from the public view - counts and geometry only.
+
+**Name-join mechanics that decide the hit rate** (`soi_owner_match.py`): deeds store "LAST FIRST M" with co-owners as "... & FIRST [LAST]"; LinkedIn last names carry credentials ("Weatherford, CRS"); Facebook's middle token is usually a MAIDEN name and is searched as an alternate surname; the nickname map is multi-target (Nikki -> Nicole/Nichole, Kathy -> Katherine/Kathleen); and a **household-pair boost** rescues spouses - if two roster contacts hit the same deed, both are lifted (Charlie Wlodyka scored 2.0 alone, confirmed by Jamie Wlodyka on the same Dublin parcel). Same-name collisions group by DISTINCT owner-name string: one person on 5 parcels is a portfolio signal, five different "JOHN SMITH" strings is ambiguity. `owner_occupied` = mailing addr-key == situs addr-key; **do not fall back to Franklin's OWNER_ADD1, it sometimes echoes the situs** and false-flagged a Texas absentee as owner-occupied.
+
+**Enformion closes the gap, and EMAIL is the verifier.** Person Search accepts name + "Columbus, OH" city/state anchor (the name-alone 400 does not apply once a metro anchor is attached). The response's `emailAddresses` (a list of DICTS, `.emailAddress` inside) is matched against the contact's exported email - an exact hit grounds identity with no address needed; name-only OH matches are kept but flagged `name_metro`. Current address = `addresses[]` with `addressOrder == 1`, read `fullAddress` + `county`. Each resolved address is cross-checked back against owners.db: surname on the deed = `owns_here` (the roll join missed a name variation or trust - 37 of 349 on the live run), someone else = renter/other-titled (74), county outside the six = `out_of_metro` (106, cleans the sphere honestly). ~$24 total, misses free.
+
+**`realtor_score` off SiftMap `get_detail` IS the Realtor AI score. Ty's rule: 95+ is a priority call.** Enrichment runs autocomplete -> get_detail per matched address and REQUIRES a token overlap between the county deed owner and SiftMap's `owner_info` before trusting the row (8 mismatches flagged, not trusted). The live distribution is steep - 191 scored: one 95+ (97), six 80s, seventeen 60-79 - so the 95+ bar isolates a real call list rather than a third of the sphere. Rows also carry equity, mortgage, portfolio count and both investor scores for an investor-referral cut. Renters are kept on their own track (future first-time buyers), RE-industry contacts (kw.com/mortgage/title domains, 27 flagged at intake) are referral partners, not homeowner sphere.
+
+**Outputs:** `soi_contacts_normalized` -> `soi_owner_matches` -> `soi_enformion_resolved` -> `soi_enriched` / `soi_enriched_recovered` -> **`soi_priority_list.csv`** (merged, ranked by realtor_score). Enformion/SiftMap stages checkpoint to `soi_enrich_state.json` / `soi_enformion_state.json` and are resumable.
 
 ## Call Coaching Engine (2026-07)
 
@@ -316,7 +971,7 @@ Pulls real call recordings from the SmrtPhone web session, transcribes them with
 
 **Autonomy ladder (`SMS_AGENT_PHASE`), because the phone number is the asset:** 1 classify + write phone status/opt-outs, 2 + escalate and flip CRM status, 3 + draft replies held in Slack for approval, 4 + auto-send a narrow gated intent set. **Phase 2 already delivers the prospector handoff with zero AI-authored text sent.** `SMS_AGENT_DRY_RUN=1` independently blocks every CRM write and every send.
 
-**Guardrails, each from a specific failure mode:** human takeover wins instantly (an `smsOutgoing` we did not author means a person typed it -> pause the thread, cancel every queued AND held message); opt-outs are decided by regex and never by a model, and cover natural language ("stop texting me", "take me off your list") not just the STOP keyword; 6-turn cap; recipient-local 8am-9pm quiet hours from the area code, with up to 30 min of wake jitter so a night's backlog is not one 08:00:00 burst; sticky sender number per conversation (switching mid-thread reads as a spam farm); per-number daily cap + pacing; a hard output validator that blocks any draft naming a dollar amount, carrying a link, over 320 chars, asking two questions, or self-identifying as automated; a 0.80 confidence floor; and `sys_`-prefixed system tags so our own writes never re-trigger the sequences that called us.
+**Guardrails, each from a specific failure mode:** human takeover wins instantly (an `smsOutgoing` we did not author means a person typed it -> pause the thread, cancel every queued AND held message); opt-outs are decided by regex and never by a model, and cover natural language ("stop texting me", "take me off your list") not just the STOP keyword; 6-turn cap; **two send windows that must both agree (Ty, 2026-08-28): our own 9am-6pm Eastern in one fixed timezone (`SMS_AGENT_BUSINESS_*`, so no reply lands when nobody here can take the callback) AND 9am-6pm recipient-local from the area code (`SMS_AGENT_QUIET_*`, the compliance half, which a fixed zone cannot express since 9am Eastern is 6am in California)**, with up to 30 min of wake jitter so a night's backlog is not one 09:00:00 burst; sticky sender number per conversation (switching mid-thread reads as a spam farm); per-number daily cap + pacing; a hard output validator that blocks any draft naming a dollar amount, carrying a link, over 320 chars, asking two questions, or self-identifying as automated; a 0.80 confidence floor; and `sys_`-prefixed system tags so our own writes never re-trigger the sequences that called us.
 
 **The loop is complete both directions.** `seed.py` renders outreach touches from `knowledge/touches.py` (the text-touch-builder pools, kept in sync with the skill) and queues them through **the same outbox as every AI reply**, so outreach gets no private send path and inherits suppression, quiet hours, per-number caps, pacing and the sticky sender. Seeding also registers `phone_map`, which is how a reply later finds its record. Staged as HELD; `release --touch N` is the deliberate go/no-go. `digest.py` is the daily readout: funnel on top, work queue underneath (drafts awaiting approval, threads a human took, soft nos old enough to rework, send failures, and a warning when webhook events sit unprocessed for a day, meaning the worker is down). Soft nos close separately from hard nos because the playbook works them again later.
 
@@ -356,6 +1011,85 @@ The team committed to the Master Material List as THE material source. Knox pric
 - **Consumers needed zero changes** (post_walkthrough Repair Numbers, comp_package scenarios, deal_analyzer, main.py rehab). Knox totals SHIFTED on purpose: real SKUs raise the too-cheap tier 1 (~+17% grand) and trim the padded tier 3 (~-18%); non-Knox and tier-4 outputs are regression-tested byte-identical. `use_locked_materials=False` opts out.
 - **rehab-estimator.skill + deal-analyzer.plugin** now ship `data/master_material_list_37914.csv` with the doctrine: locked list is the material source for the vast majority of items on Knox deals (off-list only for an outstanding random issue, flagged), cheat sheet keeps labor + non-Knox markets, never multiply locked material prices. The skill's `material_specs` JSON contract is now wired (the Material Specs sheet renderer always existed but was never fed). deal-analyzer's bundled `skills/rehab-estimator/` was EMPTY despite instructing Claude to read 5 files from it; it now carries the full 8-file skill. Both zips rebuilt with forward-slash entry names (Compress-Archive backslash paths are non-portable).
 - Re-lock cadence: re-pull before each project cycle if desired, but re-lock (an explicit, dated, git-diffable act) only when the PM re-approves the list.
+
+## The Offer Sheet: the default post-walkthrough deliverable (build 1.0.49, 2026-08-28)
+
+`src/offer_sheet.py` is THE deliverable after a walkthrough. It replaces the 8-tab post-walkthrough workbook: **one file, five tabs, Offer in front**, wholesale by default, answering exactly one question: **OFFER TO SELLER**. `--offer-only` renders just the front page.
+
+Tabs: **Offer** (the answer) | **The House** (walk condition, seller and probate intel, priced flags, gates) | **Repair Detail** | **Comps** | **Buyers**. Repair Detail, Comps and Buyers are the post_walkthrough builders REUSED as-is; The House condenses the old Overview and Repair Logic into one. Exit Strats is gone (the Offer page supersedes it and four lanes was the confusion Ty rejected), Active-Pending and Outreach are folded away.
+
+**`_hydrate()` is load-bearing.** The reused builders read `pack["sold"]` as live `MarketListing` objects, plus `finished` and an `exits["inputs"]` band; a saved pack carries comps SERIALIZED as `sold_comps`. Without the revive the Comps tab renders empty and reads like a thin market rather than a wiring bug. The buyers band is synthesized from the offer math, which is a truer target than the old exit spread.
+
+```bash
+python src/offer_sheet.py --pack output/<deal>_pack.json --walk walk_<deal>.json                           --out "<Address>_Offer.xlsx"
+```
+
+**Layout is the Fortune Builders "Deal Analyzer for Flips"** (the real file is `output/Copy of The Repair Estimator.xlsx`): paired left/right blocks under banded headers, a percent column beside every dollar column, and inputs INLINE on the same page. The three mortgage tranches are dropped, because financing is a lender-package concern and not an offer concern. Formatting helpers (`_band`, `_row`, `_kv`, `_para`, `_polish`, the INPUT/CALC/TOTAL palette) are IMPORTED from `lender_package.py`, never copied.
+
+**The math is live Excel formulas off defined names**, so one blue cell moves the whole page: `BuyerMax = RulePct * ARV - Rehab`, `OfferToSeller = BuyerMax - Fee`. Rule defaults 70%, fee $15,000 (Ty runs a flat $10-15K assignment fee, per the exit-analysis rule). The "if we buy and rehab it ourselves" block carries net profit, ROI on total cost, purchase-plus-rehab ROI and annualized cash on cash, and it is deliberately subordinate to the offer, not a competing option. Comps (5 lines) and gates (4) are condensed onto the page rather than dropped: an ARV with no visible support is unauditable.
+
+**THE STALE PACK TRAP, hit twice on one deal.** A `--save-pack` JSON is a snapshot and does NOT track later edits. On 1342 Grainger the pack still carried the original four-scenario rehab totals AND the original $481,000 engine ARV after both had been corrected, so a naive re-render produced a workbook three revisions out of date. Rules: recompute rehab via `build_rehab_matrix(subject, walk)` and NEVER read `pack["rehab"]["totals"]`; an explicit CLI `--arv` / `--as-is` WINS over the pack; and write corrections back into the pack so it stops being a landmine.
+
+**Verify by recalculating, not by reading.** The `formulas` package loads the saved xlsx and computes it the way Excel would; assert the offer figure and assert zero formula errors, then flip `RulePct` to 0.75 and confirm the offer, buyer profit and every ROI move together. **Column widths must be set AFTER `_polish`**: `_autofit` sizes off the longest string per column and the full-width paragraphs live in column A, which blew the page to 221 width units and scrolled sideways. Fixed widths total 135 and paragraph rows are re-heighted against the width the text actually gets.
+
+## The Lender Package (build 1.0.44, 2026-08)
+
+An 8-piece set handed to a private money lender to fund ONE named property. The team hand-edited every template on 2026-08-16 and those edits are the spec; the originals live in `Lender Docs Templates-*.zip`.
+
+```
+1. Cover Letter                     lender_docs.py
+2. The Private Lender Package.xlsx  lender_package.py
+3. Promissory Note                  lender_docs.py
+4. Personal Guarantee               lender_docs.py
+5. Closing Instructions Letter      lender_docs.py
+6. Insurance Request Letter         lender_docs.py
+7. Investor Information Sheet       lender_docs.py
+8. Satisfaction and Release Request lender_docs.py
+```
+
+```bash
+python src/lender_package.py --spec deals/3014_sanland_lender.json
+python src/lender_docs.py    --spec deals/3014_sanland_lender.json
+```
+Both write to `output/lender/<Deal_Name>/`, one folder per deal, numbered 1 through 8.
+
+**THE FRONT END IS A BLOCK-FOR-BLOCK MIRROR OF THE REPAIR ESTIMATOR** (`Copy of The Repair Estimator`, Ty's Drive). Not "inspired by", mirrored: Property header, then `Property Values & Pricing | Holding Costs (Monthly)` with Annually and Monthly columns, then `Financing Costs | Buying Transaction Costs` and `Selling Transaction Costs` with Perc. Of Purch and Perc. Of ARV columns, then the `Estimated Net Profit and ROI Snapshot` band, then `Purchase and Deal Analysis | Lender Coverage and Return`. Six columns: label, percent, dollars on each side. Bold `Total X:` rows close every block. The single adaptation is the last right-hand block, which is the lender's coverage instead of our cash on cash, because this is their document. **Inputs live inline on that page**, never on a separate tab, for the same reason the Estimator does it: a blue cell next to the answer gets changed, a blue cell on another tab does not.
+
+**Repair Costs is the Estimator's detail grid on its own tab** (Category / Include Y-N / Repair Type / Qty / Unit / Unit Cost / Total / Notes, banded EXTERIOR / INTERIOR / MECHANICALS / OTHER, 65 lines) and it rolls up into Estimated Repair Costs on the front page. **On a straight relist every line is switched to N and the total is zero, which is the answer rather than a missing tab.** Switch a line to Y and the budget, the loan, the LTV and every coverage ratio move with it.
+
+**Selling costs are itemized, not a flat percentage.** Escrow, recording, realtor %, transfer %, warranty, staging, marketing, misc, exactly like the Estimator. That matters beyond cosmetics: `SellFixed` and `SellVarPct` are separate names so the band-floor case reprices commission against the LOWER sale price instead of carrying the ask's dollar figure down with it.
+
+**THE COVER LETTER IS THE SPEC FOR THE WORKBOOK.** It tells the lender the package contains an overview of the deal, an overview of their contribution, a term sheet, the numbers on repairs and re-sell value, the comps, backups and risk, and next steps to fill out. So the tabs ARE that list, in that order, and nothing else: **Deal Overview, Your Investment, Term Sheet, Repair Costs, Resale Value, Comps, Backups and Risk, Next Steps** (repairs and resale being the two halves of one bullet). Do not add a tab without adding it to the cover letter first.
+
+**Structure is lifted from The Repair Estimator** (`Copy of The Repair Estimator`, Ty's Drive), because that is the sheet the team actually trusts:
+- **Inputs live INLINE on the summary page, not on their own tab.** The Estimator puts its blue cells right next to the results, which is why people actually change them. Build 1.0.41 had a separate Inputs tab and it was the thing Ty disliked.
+- Banded full-width section headers, paired left and right blocks, dense rows.
+- **A percent column beside every dollar column.** "$16,272" means nothing until it reads as 7% of ARV.
+- Bold `TOTAL X` rows closing each block, and the detail page rolls UP into the summary.
+- **The repair grid carries a Y/N per line.** Switch a category to N and `RehabTotal`, the loan, and every coverage ratio drop with it.
+
+**Everything is a live Excel formula** off workbook defined names, including the sentences (`_say()` + `_t()` build `="..."&TEXT(Loan,"$#,##0")&"..."`, and the LTV paragraph is a live `IF(LTV>0.75,...)`). 240 formulas across the two live deals, verified by actually recalculating with the `formulas` pip package.
+
+**Derived, never typed:** `DayOne = Loan - RehabTotal`. Typing the closing advance let financed closing costs land in the draw tranche, so the holdback disagreed with the repair budget ($88,800 against an $87,192 scope). Anything definitionally equal to other cells is a formula. The one deliberate exception is **`Loan`, which is a single blue input**: it is a negotiated number, not a derived one, and making it the only lever that sets the deal is what keeps the front page simple. `Borrower Cash` then falls out as `Purchase + Repairs + BuyCosts + HoldTotal - Loan`, deliberately excluding interest because that is paid from sale proceeds rather than at closing.
+
+**Read the workbook back before regenerating over it.** Ty reviews in Excel and edits input cells directly. On the 158 review he made three changes and only mentioned one: realtor fees 6% to 5%, as-is raised to match the ask, and he deleted a comp. Diff the blue cells against the spec before overwriting, and rewrite any prose that cites a number or a comp he moved.
+
+**Contract changes from the team's edits, all of which move numbers:**
+- **The LOAN covers closing costs, document prep, recording and the lender's title policy**, repaid with interest and backed by the guarantee. It used to be borrower cash.
+- **Every member of the company personally guarantees the note**, so `borrower.members` is a list and the guarantee plus closing letter render one signature block each.
+- **Default is not a penalty rate and not a foreclosure lecture.** On default we liquidate immediately and the guarantee covers any shortfall including interest still owed. That framing replaced the old 15% default-rate language everywhere.
+- **Minimum interest is quoted as a percent as well as months** ("3% guaranteed" at 12% over 3 months).
+- `deal_type` picks the wholetail or flip branch in the cover letter; a non-zero repair budget picks builder's risk over vacant dwelling on the insurance letter. **Exactly one side of every OR gets written.**
+
+**The templates carry a NOTES FOR CLAUDE block that must never reach a lender.** `build_all()` re-reads each rendered document and raises if the string survives, rather than trusting the code path. Same reflex as the partial-set guard: `main()` exits 1 if fewer than 7 documents write, and stale files from a previous numbering are deleted so a folder cannot grow a second copy of everything.
+
+**No deed of trust template on purpose:** in TN the closing attorney draws it on their own form for the Register of Deeds and the title underwriter, so a downloaded form is a recording problem rather than a shortcut. Document 5 tells them exactly what to prepare instead.
+
+**Voice** comes from `CMO Stack/context/voice-guide.md`. The note and the guarantee stay in formal legal register; the letters are in Ty's voice. Audit scans rendered formula output as well as static cells for em/en dashes, ~30 AI tell words, leaked notes and unresolved `XXXXXX` placeholders. Current state on both deals: zero.
+
+**FORMATTING IS PART OF THE DELIVERABLE.** Nobody should drag a column or a row to read this workbook. `_polish()` runs over every sheet after the content is written: column widths come from the longest thing actually in each column, then wrapped rows get a height computed from the width they ended up with, plus landscape fit-to-width print setup. The trick that makes it work is **`_rendered_len()`, which measures what a cell will SHOW rather than what it holds.** A formula cell stores `="..."&TEXT(Loan,"$#,##0")&"..."` but displays a sentence, so sizing off the raw formula blows every column out; the function sums the quoted literals, adds 12 per `TEXT()`, and takes 62% when there is an `IF()` because only one branch ever renders. **Verify formatting against DISPLAYED text, not raw values:** a coverage cell holds 1.1176756139 and shows "1.12x", so a naive width check reports false overflows. Apply the number format first. Both live deals currently pass at zero fit problems.
+
+**Gotcha:** Excel holds an exclusive lock, so a workbook open on the desktop makes `wb.save()` raise `PermissionError` and `formulas` cannot even read it. Write to a `_PENDING_` name and swap.
 
 ## FTM Foreclosure: multi-pass skip-trace + screenshot-MMS (2026-06; orchestrated from `_api`)
 
@@ -690,7 +1424,7 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
 
-## REI Skill Library (18 Skills)
+## REI Skill Library (21 Skills)
 
 Distribution-ready Claude Co-Work skill files at `Skills for REI/improved/`. Each `.skill` is a ZIP containing `SKILL.md` + `references/` folder. Plugins (`.plugin`) also include `commands/` and `.claude-plugin/plugin.json`.
 
@@ -710,13 +1444,15 @@ Distribution-ready Claude Co-Work skill files at `Skills for REI/improved/`. Eac
 | 10 | `sequential-presets.skill` | Operations | 9.5 | 12 niche + 9 bulk filter presets, Pendulum Theory (SMS→Call→Mail→DP), DataSift UI implementation steps |
 | 11 | `sift-sequences.skill` | CRM | 9.5 | 26 TCA sequence templates (verified against `sequence_templates.py`), UI walkthrough, HOT A01-A16 chains |
 | 12 | `sift-operations.plugin` | CRM | 9.3 | CRM operations encyclopedia, STABM routine, lead pipeline (9 statuses), task presets, team roles |
-| 13 | `playbook-creator.skill` | Operations | 9.5 | Playbook/SOP generator from transcripts, 7-node chart limit, 5th grade reading level, Word doc output |
+| 13 | `playbook-creator.skill` | Operations | 2026-08 | Three-format doc engine: Playbook, SOP (human Word doc + agent-executable `.sop.md` twin per the open Agent SOPs standard, RFC 2119 constraints, `scripts/validate_sop.py`), and Scribe-style Step Guide (zero-padded `Step 01:` action-verb headings, one capture/highlight/crop screenshot spec per step, title under 60 chars). 7-node chart limit, 5th grade reading level, Word doc output |
 | 14 | `text-touch-builder.skill` | Operations | 2026-08 | Four-text-touch pre-call SMS sequence per ready-to-call record (identity check, drip, soft ask, breakup) with cold-email style copy rotation; CSV export -> stdlib script -> Add-Data re-import into Text Touch 1-4 custom fields. **Human-voice gate added 2026-08:** `AI_TELLS` refuses (not warns) any message or pool variant containing an em/en dash, a semicolon, a link, emoji, ALL CAPS, stacked exclamations, form-letter openers, or AI vocabulary; `--check-pools` audits the variants and runs on every invocation. Same list mirrored in `src/sms_agent/respond.py` so outbound touches and inbound replies sound like one person. Community-safe (no internal API) |
 | 15 | `cold-call-coach.skill` | Operations | new | Pull SmrtPhone cold-call recordings, audio-model transcription with real tonality notes, grade vs the cold-calling rubric (measured reliability +/-3 pts, calibration examples, short calls on their own scale, JSON score footers), Excel workbook export. Self-contained scripts, config-driven roster |
 | 16 | `lead-manager-coach.skill` | Operations | new | Same engine, lead-management rubric: 4 pillars qualification, roadblocks, no-ladder, next-action discipline. Call quality only (no CRM hygiene scoring) |
 | 17 | `closer-coach.skill` | Operations | new | Same engine, closer rubric: money conversation, three-option offer stack, objection frameworks, commitment locking, negotiation timeline reports |
 | 18 | `kpi-engine.skill` | Operations | new | Universal DataSift KPI reporting from the user's own account: activity-log pull (self-contained stdlib script, own JWT, no internal API), three distinct rates, lead counting incl new_lead statuses, funnel pacing (dials->correct->leads->appts->contracts), record-level detail mode, md/CSV/Excel/Slack outputs. Benchmarks shipped as tune-per-operation baselines; internal production version lives in Deal Room `_api/kpi-engine/` |
 | 19 | `comp-package.skill` | Deal Analysis | new | Boundary-filtered comp package: /search API pull with 41-row-cap band partitioning, condition bucketing by price/Zestimate ratio, dual-track ARV (same-bed base + labeled reconfig upside), 3-scenario rehab, MAO math, buyer targeting, Excel deliverable spec. Community-safe (own OPENWEBNINJA_API_KEY, requests-only script) |
+| 20 | `vendor-directory-builder.skill` | Operations | new | Vetted contractor/vendor directory for any market: community mining (FB in-group search, self-promoters + recommendation-thread comments), public-record verification (phone provenance, service area, rating with count, license board, BBB), geo sweep + gap analysis + niche gatekeeper layer (utility districts), Excel via bundled build_directory.py. Never-fabricate rule; also THE tool for vetting a found/AI-generated list. Community-safe (openpyxl only, fictional example data) |
+| 21 | `contractor-call-sheet.skill` | Operations | new | Action layer on a finished directory: printable one-page call sheet (build_call_sheet.py, fuzzy column detection, call-first banner for cross-validated providers) + personalized first-contact texts/voicemails + the 6 vetting-call questions. Drafts only, never sends. Community-safe (openpyxl only) |
 
 ### Cross-Skill Verified Consistency
 

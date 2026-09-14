@@ -233,6 +233,128 @@ def cmd_pause(args) -> int:
     return 0
 
 
+def cmd_phone_types(args) -> int:
+    """Suppress litigators and write real line types, in one Trestle pass."""
+    from . import phone_types
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    store.init()
+    out = phone_types.run(args.preset, limit=args.limit, commit=args.commit,
+                          voip_as=args.voip_as)
+    print(json.dumps(out, indent=2))
+    if not args.commit:
+        print("\ndry run: no Trestle calls made, nothing written. Add --commit.")
+    return 0
+
+
+def cmd_resume(args) -> int:
+    """Hand a paused thread back to the agent.
+
+    Needed because takeover detection now fails closed: where the ledger cannot
+    prove we sent a message into a live thread, the thread pauses. That is the
+    right default, and it is only shippable with a one command way back.
+    """
+    store.init()
+    phone = store.clean_phone(args.phone)
+    conv = store.get_conversation(phone)
+    if not conv:
+        print(f"no conversation for {phone}")
+        return 1
+
+    state = conv.get("state") or ""
+    why = conv.get("paused_reason") or ""
+    if state in ("opted_out", "closed") and not args.force:
+        print(f"{phone} is {state} ({why or 'no reason recorded'}).")
+        print("An opt-out is a legal state, not a pause. Re-read the thread before --force.")
+        return 1
+
+    reason = store.is_suppressed(phone)
+    if reason and not args.force:
+        print(f"{phone} is suppressed ({reason}); resuming alone would change nothing")
+        print("because the worker cancels anything queued while suppression stands.")
+        return 1
+
+    targets = [phone]
+    if args.siblings:
+        record_uuid = conv.get("record_uuid") or (store.lookup_phone(phone) or {}).get("record_uuid")
+        targets += [p for p in store.phones_for_record(record_uuid or "") if p != phone]
+
+    for p in targets:
+        store.update_conversation(p, state="active", paused_reason="")
+        print(f"{p} active again (was {state or 'unknown'}: {why or 'no reason'})")
+
+    if reason:
+        print(f"NOTE: {phone} is still suppressed as {reason}; nothing will send until that clears.")
+    # Cancelled rows stay cancelled on purpose: they carry copy written before
+    # the human's message, so re-queueing them reproduces the exact bug this
+    # command exists to recover from.
+    print("Queued messages stay cancelled. Re-stage with: cli.py campaign --queue")
+    print(f"NOTE: the {config.TAG_AI_PAUSED} tag is still on the record; clear it in DataSift by hand.")
+    return 0
+
+
+def cmd_call_takeover(args) -> int:
+    """Sweep the call log; a real conversation on the phone silences the thread."""
+    from . import call_takeover
+
+    store.init()
+    out = call_takeover.run(pages=args.pages, hours=args.hours, apply=not args.dry_run)
+    if out.get("error"):
+        print(f"could not read the call log: {out['error']}")
+        return 2
+    verb = "would pause" if args.dry_run else "paused"
+    print(f"scanned {out['rows_scanned']} call(s) in the last {args.hours}h: "
+          f"{out['too_short']} too short, {out['not_our_thread']} not our thread, "
+          f"{out['already_inactive']} already inactive, {out['paused']} {verb}")
+    for r in out["results"]:
+        print(f"  {r['phone']}  {r['reason']}")
+    return 0
+
+
+def cmd_events(args) -> int:
+    """Show what a webhook actually sends us.
+
+    Authorship logic was wrong for months because it was written against a
+    payload shape nobody had looked at. This makes looking one command.
+    """
+    import collections
+    import json as _json
+
+    store.init()
+    rows = list(store._conn().execute(
+        "SELECT payload, outcome FROM events WHERE event_type=? ORDER BY id DESC LIMIT ?",
+        (args.type, args.limit),
+    ))
+    print(f"{len(rows)} {args.type} event(s)")
+    if not rows:
+        return 0
+
+    keys: collections.Counter = collections.Counter()
+    combos: collections.Counter = collections.Counter()
+    outcomes: collections.Counter = collections.Counter()
+    for r in rows:
+        try:
+            d = _json.loads(r["payload"])
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        keys.update(d.keys())
+        combos[(str(d.get("source")), str(d.get("userName")))] += 1
+        outcomes[str(r["outcome"])[:60]] += 1
+
+    print("\nfields present:")
+    for k, n in keys.most_common():
+        print(f"  {k:<16} {n}")
+    print("\nsource / userName:")
+    for (src, usr), n in combos.most_common(20):
+        print(f"  {n:>6}  source={src!r} userName={usr!r}")
+    print("\nrecorded outcomes:")
+    for o, n in outcomes.most_common(15):
+        print(f"  {n:>6}  {o}")
+    return 0
+
+
 def cmd_numbers(args) -> int:
     """Show the sending pool, or re-sync it from smrtPhone."""
     from . import numbers_sync
@@ -336,7 +458,12 @@ def cmd_campaign(args) -> int:
     """Touch-aware run across the whole Hottest cadence."""
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     store.init()
-    plan = campaign.build(sender_fallback=args.sender or "", log_pages=args.log_pages)
+    # Default to the real daily cap so a preview costs what a real build costs
+    # and shows the same answer. Unbounded would vet every record in every
+    # source, which is thousands of CRM reads to then discard most of them.
+    limit = args.limit or config.CAMPAIGN_DAILY_CAP or sender_pool.capacity_today()["remaining"]
+    plan = campaign.build(sender_fallback=args.sender or "", log_pages=args.log_pages,
+                          limit=limit)
     print(campaign.summary(plan))
     if args.show:
         print()
@@ -545,6 +672,33 @@ def main() -> int:
     p.add_argument("--reason")
     p.set_defaults(fn=cmd_pause)
 
+    p = sub.add_parser("phone-types",
+                       help="Trestle pass: suppress litigators and write real line types")
+    p.add_argument("--preset", default="FTM - 02 Ready to Call")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--commit", action="store_true", help="call Trestle and write")
+    p.add_argument("--voip-as", choices=("mobile", "unknown"), default="unknown")
+    p.set_defaults(fn=cmd_phone_types)
+
+    p = sub.add_parser("resume", help="hand a paused conversation back to the agent")
+    p.add_argument("phone")
+    p.add_argument("--siblings", action="store_true",
+                   help="also resume every other line on the same record")
+    p.add_argument("--force", action="store_true",
+                   help="resume even when opted out, closed or suppressed")
+    p.set_defaults(fn=cmd_resume)
+
+    p = sub.add_parser("call-takeover", help="a connected call silences that thread")
+    p.add_argument("--hours", type=int, default=24, help="how far back to sweep (default 24)")
+    p.add_argument("--pages", type=int, default=2, help="call-log pages of 200 (default 2)")
+    p.add_argument("--dry-run", action="store_true", help="report only, pause nothing")
+    p.set_defaults(fn=cmd_call_takeover)
+
+    p = sub.add_parser("events", help="show what a webhook actually sends us")
+    p.add_argument("--type", default="smsOutgoing", help="event_type to inspect")
+    p.add_argument("--limit", type=int, default=1000)
+    p.set_defaults(fn=cmd_events)
+
     p = sub.add_parser("numbers", help="show or re-sync the sending pool from smrtPhone")
     p.add_argument("--refresh", action="store_true", help="re-pull from smrtPhone and rewrite the file")
     p.add_argument("--push", action="store_true", help="print the secret line for the live box")
@@ -566,8 +720,11 @@ def main() -> int:
     p.add_argument("--commit", action="store_true")
     p.set_defaults(fn=cmd_backfill)
 
-    p = sub.add_parser("campaign", help="touch-aware run across the whole Hottest cadence")
+    p = sub.add_parser("campaign", help="touch-aware run across every source cadence")
     p.add_argument("--sender", help="fallback caller first name")
+    p.add_argument("--limit", type=int, default=0,
+                   help="stop after this many candidates (default: the daily cap, "
+                        "so the preview matches what the scheduler would build)")
     p.add_argument("--show", type=int, default=6)
     p.add_argument("--log-pages", type=int, default=6, help="pages of SMS history to read")
     p.add_argument("--queue", action="store_true", help="stage as HELD outbox rows")

@@ -85,6 +85,12 @@ REISIFT_API_KEY = _env("REISIFT_API_KEY", "")
 
 # ---------------------------------------------------------------- Slack
 SLACK_WEBHOOK_URL = _env("SMS_AGENT_SLACK_WEBHOOK") or _env("SLACK_WEBHOOK_URL", "")
+# The dispo program posts to its OWN channel. Buyer traffic and seller
+# traffic are different audiences and different people act on them, so
+# a single webhook would put 'a price went out to 156 buyers' in the
+# seller text-leads channel. Falls back to the seller webhook, which is
+# wrong-channel but not silent, and doctor() says so.
+DISPO_SLACK_WEBHOOK_URL = _env("SMS_AGENT_DISPO_SLACK_WEBHOOK", "")
 
 # ---------------------------------------------------------------- model
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")
@@ -106,6 +112,16 @@ DRY_RUN = _env("SMS_AGENT_DRY_RUN", "1") not in ("0", "false", "False", "")
 MAX_AI_TURNS = int(_env("SMS_AGENT_MAX_TURNS", "6"))
 # Below this the reply is drafted for approval instead of sent.
 CONFIDENCE_FLOOR = float(_env("SMS_AGENT_CONFIDENCE_FLOOR", "0.80"))
+
+# How recently we must have recorded sending a text for its webhook echo to
+# count as ours. Wide enough to clear webhook plus write latency (seconds, or
+# under a minute across a worker restart), far under the one-per-day manual
+# touch cadence, and matched to MIN_SEND_GAP_SECONDS so the window can never
+# span two of our own sends to the same thread.
+AUTHORSHIP_WINDOW_MINUTES = int(_env("SMS_AGENT_AUTHORSHIP_WINDOW", "10"))
+# A call shorter than this is a voicemail or a wrong number, not a human taking
+# over the conversation. Same threshold the call coaching pipeline already uses.
+CALL_TAKEOVER_MIN_SECONDS = int(_env("SMS_AGENT_CALL_TAKEOVER_SECONDS", "60"))
 # Recipient-local send window. A bot texting at 11pm is both a compliance
 # problem and the clearest tell that it is a bot.
 QUIET_START_HOUR = int(_env("SMS_AGENT_QUIET_START", "8"))
@@ -124,6 +140,57 @@ CAMPAIGN_START_HOUR = int(_env("SMS_AGENT_CAMPAIGN_START", "9"))
 CAMPAIGN_END_HOUR = int(_env("SMS_AGENT_CAMPAIGN_END", "18"))
 CAMPAIGN_ENABLED = _env("SMS_AGENT_CAMPAIGN", "0") not in ("0", "false", "no")
 CAMPAIGN_DAILY_CAP = int(_env("SMS_AGENT_CAMPAIGN_DAILY_CAP", "0"))  # 0 = pool capacity
+# Post an alert when a day releases fewer than this. 0 disables it. Daily volume
+# fell from 180 to 19 over four days in August and nothing said so; this is the
+# line that would have caught it the first morning.
+CAMPAIGN_MIN_EXPECTED = int(_env("SMS_AGENT_CAMPAIGN_MIN_EXPECTED", "0"))
+
+# May we text a phone whose do-not-call flag we cannot see?
+#
+# The flag exists ONLY on a records-search row's representative phone.
+# Verified 2026-08-31 against the full record, the owner endpoint, and a
+# targeted search: the phone object carries number/type/status/tags/
+# is_connected and nothing else, and searching a non-representative number
+# returns the record's representative phone instead. So for any other number
+# on a record the flag is not merely unread, it is unavailable.
+#
+# It is DataSift's registry scrub, not a person's opt-out: a real opt-out
+# writes DNC / CORRECT_DNC / WRONG_DNC into the phone STATUS, which we do see
+# on every phone and always honour. This setting governs only the scrub.
+#
+# Ty, 2026-08-31: "DNC is okay, but the litigation list here on sellers is what
+# we'd want to suppress throughout the entire process." So this defaults OFF
+# and the hard block is the litigator list below, which is the real exposure.
+#
+# 1: refuse a phone whose flag cannot be seen. Costs about 62 FTM candidates a
+#    day, roughly 136 sends instead of 175.
+# 0 (default): text the best phone on the record, honouring the phone status
+#    and our own suppression, accepting that the registry scrub is invisible.
+REQUIRE_VISIBLE_DNC = _env("SMS_AGENT_REQUIRE_VISIBLE_DNC", "0") not in ("0", "false", "no")
+
+# TCPA serial-plaintiff suppression. Trestle returns
+# `add_ons.litigator_checks["phone.is_litigator_risk"]` on the SAME call that
+# returns line type, so one pass answers both. A hit is written into the local
+# suppression table, which every send path already consults, so the block
+# covers outreach, replies and any future program without new plumbing.
+LITIGATOR_SUPPRESSION_REASON = "litigator"
+
+# OUR OWN business hours, in one fixed timezone, applied to EVERY outbound
+# message rather than only to the campaign build (Ty, 2026-08-28: "9 am to
+# 6 pm Eastern from here on").
+#
+# This is a SECOND gate, not a replacement for recipient-local quiet hours.
+# The two answer different questions and neither covers the other. Recipient
+# local asks "is it a civil hour where they live", which is the compliance
+# question and cannot be expressed in a fixed zone, because 9am Eastern is 6am
+# in California. This one asks "are we open", so a reply never lands at an hour
+# when nobody here can take the callback it invites. A send needs BOTH, and the
+# queue waits for the overlap.
+#
+# Defaults follow the campaign window so there is one place to change the hours.
+BUSINESS_TZ = _env("SMS_AGENT_BUSINESS_TZ", CAMPAIGN_TZ)
+BUSINESS_START_HOUR = int(_env("SMS_AGENT_BUSINESS_START", str(CAMPAIGN_START_HOUR)))
+BUSINESS_END_HOUR = int(_env("SMS_AGENT_BUSINESS_END", str(CAMPAIGN_END_HOUR)))
 CAMPAIGN_DAYS = _env("SMS_AGENT_CAMPAIGN_DAYS", "0,1,2,3,4")  # Mon-Fri
 
 # Whole days between one owner's touches. A follow-up goes out EVERY day to
@@ -136,6 +203,43 @@ TOUCH_GAP_DAYS = int(_env("SMS_AGENT_TOUCH_GAP_DAYS", "1"))
 HEARTBEAT_STALE_MINUTES = int(_env("SMS_AGENT_HEARTBEAT_STALE", "20"))
 # Per-number daily send cap, well under the 10DLC ceiling.
 DAILY_CAP_PER_NUMBER = int(_env("SMS_AGENT_DAILY_CAP", "25"))
+
+# PER-POOL overrides, e.g. {"Dispo": 35}. The cap is a compliance knob,
+# and it used to be one global number: raising it so a 156-message dispo
+# blast fits in one day would also have raised the acquisitions numbers
+# from 25, which is a carrier-risk change to a different program nobody
+# asked for. Pools that are not listed keep DAILY_CAP_PER_NUMBER.
+def _pool_caps():
+    import json as _json
+    raw = _env("SMS_AGENT_POOL_CAPS", "")
+    if not raw:
+        return {}
+    try:
+        data = _json.loads(raw)
+        return {str(k): int(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+POOL_CAPS = _pool_caps()
+
+
+# PER-POOL send gap, e.g. {"Dispo": 300}. Same reasoning as POOL_CAPS:
+# pacing is a carrier-risk setting per program, and the dispo blast needs
+# a tighter rest than acquisitions to clear its window without breaking
+# the sticky-number rule. Pools not listed keep MIN_SEND_GAP_SECONDS.
+def _pool_gaps():
+    import json as _json
+    raw = _env("SMS_AGENT_POOL_GAPS", "")
+    if not raw:
+        return {}
+    try:
+        return {str(k): int(v) for k, v in _json.loads(raw).items()}
+    except Exception:
+        return {}
+
+
+POOL_GAPS = _pool_gaps()
 # Minimum seconds between two sends from the SAME number. A real person does
 # not fire three texts off one phone in a minute; carriers notice, and so do
 # recipients. Ten minutes keeps each number's pattern human.
@@ -153,6 +257,14 @@ TAG_AI_PAUSED = f"{TAG_PREFIX}ai_paused"
 TAG_AI_HANDLED = f"{TAG_PREFIX}ai_handled"
 TAG_ESCALATED = f"{TAG_PREFIX}escalated"
 TAG_OPT_OUT = "Do Not Market"
+# Marketing dispositions for sensitive replies (Ty, 2026-08-26). A grieving
+# family telling us to go away does not need a Slack post; it needs the record
+# marked so nobody contacts them again. The channel is for live sellers.
+TAG_MAIL_ONLY = _env("SMS_AGENT_TAG_MAIL_ONLY", "Mail Only")
+# Post a sensitive reply to Slack ONLY when it carries legal exposure (a lawyer,
+# a regulator, a harassment claim, a minor). Everything else is dispositioned
+# silently: suppressed, tagged, and noted on the record.
+SENSITIVE_SLACK_LEGAL_ONLY = _env("SMS_AGENT_SENSITIVE_SLACK_LEGAL_ONLY", "1") not in ("0", "false", "False", "")
 
 # Identity. The thread is signed by the person ACTUALLY ASSIGNED to the record
 # (the `assigned_to` uuid), so the name in the text is the name that calls.

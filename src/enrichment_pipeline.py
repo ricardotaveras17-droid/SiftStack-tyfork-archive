@@ -233,6 +233,13 @@ def detect_existing_enrichment(
 # ── Filters ──────────────────────────────────────────────────────────
 
 
+# Notice types that structurally carry no property address in the notice body.
+# A probate filing names the decedent and the personal representative; the
+# property is found afterwards (Knox Tax API by decedent name -> executor family
+# search -> people search). Judging them by house number deletes the entire type.
+NO_ADDRESS_TYPES = {"probate", "divorce"}
+
+
 def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
     """Remove records where the property address has no real house number.
 
@@ -242,6 +249,12 @@ def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
     Records flagged `needs_manual_address` are kept regardless — those
     are block/lot tax-sale addresses we intentionally preserve for
     manual downstream lookup.
+    Notice types in NO_ADDRESS_TYPES are exempt. "No address" means "not looked
+    up yet" for them, not "vacant lot": a mixed run of foreclosure + probate
+    used to lose 100% of the probate records here while the foreclosures came
+    through fine, so the run looked healthy and the whole type quietly vanished.
+    Exempting per-record keeps the filter doing its real job on the types that
+    do carry an address.
     """
 
     def _has_house_number(addr: str) -> bool:
@@ -254,13 +267,26 @@ def _filter_vacant_land(notices: list[NoticeData]) -> list[NoticeData]:
         return int(m.group(1)) > 0
 
     before = len(notices)
+    # The exemption is for "not looked up YET", not "exempt forever". A probate
+    # record whose lookup RESOLVED to vacant land ("0 Minnis Ave") is a real
+    # vacant lot and should drop like any other; only an EMPTY address gets the
+    # pass, because that one is still waiting on property_lookup. Seven such
+    # lots reached DataSift before this distinction was drawn.
     result = [
         n for n in notices
-        if n.needs_manual_address == "yes" or _has_house_number(n.address)
+        if n.needs_manual_address == "yes"
+        or (n.notice_type in NO_ADDRESS_TYPES and not n.address.strip())
+        or _has_house_number(n.address)
     ]
     removed = before - len(result)
     if removed:
         logger.info("  Removed %d vacant land records (no house number)", removed)
+    exempt = sum(1 for n in result if n.notice_type in NO_ADDRESS_TYPES and not n.address)
+    if exempt:
+        logger.info(
+            "  Kept %d address-less records of types %s (address resolved downstream)",
+            exempt, "/".join(sorted(NO_ADDRESS_TYPES)),
+        )
     return result
 
 
