@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Weekly watch on the fork parent (tyvhb/SiftStack).
+"""Weekly watch on the fork parent (DataSift-Ty-Personal/SiftStack).
+
+The parent was renamed out of tyvhb/SiftStack. The old URL still resolves only
+because GitHub redirects a rename, and that redirect dies the moment anyone
+claims the old name, so this uses the canonical one.
 
 Reports only. Fetches, reads, prints. Never merges, commits, pushes, or edits
 a tracked file.
@@ -21,7 +25,7 @@ import os
 import subprocess
 import sys
 
-UPSTREAM_URL = "https://github.com/tyvhb/SiftStack"
+UPSTREAM_URL = "https://github.com/DataSift-Ty-Personal/SiftStack.git"
 UPSTREAM = "upstream"
 # Overridable so the check itself can be tested against a known-changed state.
 # A watcher that only ever prints "nothing new" is indistinguishable from one
