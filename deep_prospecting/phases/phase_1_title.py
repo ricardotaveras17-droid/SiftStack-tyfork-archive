@@ -103,15 +103,16 @@ def _last_name(name: str) -> str:
     """Pull the surname out of a free-text owner field.
 
     Handles both "LAST, FIRST" (MOD-IV format) and "First Last" (caller
-    input). Lower-cases for case-insensitive comparison.
+    input), including multi-word surnames. Lower-cases for comparison.
+
+    Delegates to _utils.split_name. Previously this took the last whitespace
+    token, so the same person in the two formats compared unequal whenever the
+    surname had a particle ("Antoinette Del Duca" -> "duca" vs
+    "DEL DUCA, ANTOINETTE M" -> "del duca"), which suppressed the
+    same-surname death signal in branch 4 below and sent the MOD-IV
+    owner-fallback lookup searching the wrong surname.
     """
-    if not name:
-        return ""
-    n = name.strip()
-    if "," in n:
-        return n.split(",", 1)[0].strip().lower()
-    tokens = [t for t in re.split(r"\s+", n) if t]
-    return tokens[-1].lower() if tokens else ""
+    return _utils.last_name(name)
 
 
 def _name_token_key(name: str) -> str:

@@ -344,7 +344,12 @@ def run_watcher(
                                     )
                                 else:
                                     upload_result = _asyncio.run(
-                                        upload_to_datasift(csv_infos[0]["path"], enrich=True, skip_trace=True)
+                                        upload_to_datasift(
+                                            # Explicit target list — upload_csv
+                                            # no longer derives one.
+                                            csv_infos[0]["path"], enrich=True,
+                                            skip_trace=True, list_name="SiftStack",
+                                        )
                                     )
                                 if upload_result.get("success"):
                                     logger.info("DataSift upload: %s", upload_result.get("message", "OK"))

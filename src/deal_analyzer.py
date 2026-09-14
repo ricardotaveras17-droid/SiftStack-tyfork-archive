@@ -9,6 +9,7 @@ Usage:
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -37,7 +38,11 @@ DEFAULT_INSURANCE_MONTHLY = 150.0
 DEFAULT_UTILITIES_MONTHLY = 200.0
 DEFAULT_AGENT_COMMISSION = 0.06    # 6% (3% buyer + 3% seller)
 DEFAULT_CLOSING_COSTS_PCT = 0.025  # 2.5% of sale price
-DEFAULT_TRANSFER_TAX_PCT = 0.0037  # TN transfer tax: $0.37 per $100
+# Transfer tax is state-specific and, in New Jersey, steeply progressive. It
+# lands on the RESALE side of a flip, so it is our cost. This module used to
+# apply Tennessee's flat 0.37% to every deal in every state, which understated
+# an NJ resale by roughly $1,700 on a $400K sale.
+DEFAULT_TRANSFER_TAX_PCT = 0.0037  # Tennessee only: $0.37 per $100
 DEFAULT_WHOLESALE_FEE = 10000.0
 DEFAULT_FLIP_RULE = 0.75           # 75% Rule: MAO = ARV × 0.75 - rehab
 DEFAULT_WHOLESALE_RULE = 0.70      # 70% Rule for wholesale
@@ -46,6 +51,108 @@ DEFAULT_CASH_ON_CASH_TARGET = 0.10 # 10% target CoC return
 DEFAULT_VACANCY_RATE = 0.08        # 8% vacancy
 DEFAULT_MAINTENANCE_PCT = 0.01     # 1% of value annually
 DEFAULT_PROP_MGMT_PCT = 0.10       # 10% of rent
+
+# ── Transfer tax ──────────────────────────────────────────────────────
+
+
+class UnknownTransferTaxError(ValueError):
+    """Raised when no transfer-tax schedule is calibrated for a state.
+
+    Deliberately fatal, for the same reason the region lookup is: quietly
+    applying one state's rate to another is a silent, systematic understatement
+    of cost that flows straight into profit.
+    """
+
+
+# New Jersey Realty Transfer Fee. Seller-paid, graduated by portion.
+# Source: NJ Division of Taxation — https://www.nj.gov/treasury/taxation/realty.shtml
+# Verified 2026-08-20.
+#
+# NJ uses TWO bracket tables and switches wholly between them at $350,000; it is
+# not one table with an extra bracket on top. A $350,001 sale is charged on the
+# higher table from the first dollar, so crossing $350K costs about $630 more in
+# fee than stopping just under it. That cliff is real and is worth knowing when
+# pricing a resale near the line.
+_NJ_RTF_TO_350K = (          # (bracket upper bound, dollars per $500)
+    (150_000, 2.00),
+    (200_000, 3.35),
+    (350_000, 3.90),
+)
+_NJ_RTF_OVER_350K = (
+    (150_000, 2.90),
+    (200_000, 4.25),
+    (550_000, 4.80),
+    (850_000, 5.30),
+    (1_000_000, 5.80),
+    (float("inf"), 6.05),
+)
+
+# Graduated Percent Fee — replaced the buyer-paid 1% "mansion tax" for contracts
+# fully executed on or after 2025-07-10, and is now SELLER-paid. Applies to
+# Class 2 residential, Class 4A commercial, Class 4C co-ops and certain farms.
+# These are NOT marginal rates: the tier rate applies to the ENTIRE
+# consideration, so $2.2M is taxed 2% on all $2.2M ($44,000), not on the excess.
+_NJ_GRADUATED_PCT = (        # (tier upper bound, rate on full consideration)
+    (2_000_000, 0.010),
+    (2_500_000, 0.020),
+    (3_000_000, 0.025),
+    (3_500_000, 0.030),
+    (float("inf"), 0.035),
+)
+
+# Not modelled: NJ partial exemptions (senior citizen, blind, disabled,
+# low/moderate-income housing) and the new-construction schedule. All of them
+# REDUCE the fee, so ignoring them is conservative for underwriting.
+
+
+def _nj_realty_transfer_fee(consideration: float) -> float:
+    """NJ RTF plus, above $1M, the Graduated Percent Fee. Seller side."""
+    if consideration <= 0:
+        return 0.0
+
+    # The statute charges each $500 "or fractional part thereof", so the
+    # consideration rounds up to the next $500 before the brackets apply.
+    taxable_total = math.ceil(consideration / 500.0) * 500.0
+
+    table = _NJ_RTF_TO_350K if taxable_total <= 350_000 else _NJ_RTF_OVER_350K
+    fee = 0.0
+    lower = 0.0
+    for upper, per_500 in table:
+        if taxable_total <= lower:
+            break
+        in_bracket = min(taxable_total, upper) - lower
+        fee += (in_bracket / 500.0) * per_500
+        lower = upper
+
+    if taxable_total > 1_000_000:
+        for tier_upper, pct in _NJ_GRADUATED_PCT:
+            if taxable_total <= tier_upper:
+                fee += taxable_total * pct
+                break
+
+    return fee
+
+
+# The property API returns the state inconsistently ("NJ" or "New Jersey"),
+# so normalise before matching rather than raising on a spelling.
+_STATE_ALIASES = {"NEW JERSEY": "NJ", "N.J.": "NJ", "TENNESSEE": "TN", "TENN.": "TN"}
+
+
+def calculate_transfer_tax(sale_price: float, state: str = "") -> float:
+    """Transfer tax on a sale, by state. Raises on an uncalibrated state."""
+    st = (state or "").strip().upper()
+    st = _STATE_ALIASES.get(st, st)
+    if st == "NJ":
+        return _nj_realty_transfer_fee(sale_price)
+    if st == "TN":
+        return sale_price * DEFAULT_TRANSFER_TAX_PCT
+    raise UnknownTransferTaxError(
+        f"No transfer-tax schedule is calibrated for state {state!r}. "
+        "Calibrated states: NJ, TN. Add the state's schedule rather than "
+        "borrowing another state's rate — transfer tax varies by an order of "
+        "magnitude between states and lands directly in net profit."
+    )
+
 
 # ── Data structures ───────────────────────────────────────────────────
 
@@ -214,11 +321,15 @@ def calculate_holding_costs(purchase_price: float, rehab_months: float,
     )
 
 
-def calculate_selling_costs(sale_price: float) -> SellingCosts:
-    """Calculate costs to sell the property."""
+def calculate_selling_costs(sale_price: float, state: str = "") -> SellingCosts:
+    """Calculate costs to sell the property.
+
+    Raises:
+        UnknownTransferTaxError: no transfer-tax schedule for ``state``.
+    """
     commission = sale_price * DEFAULT_AGENT_COMMISSION
     closing = sale_price * DEFAULT_CLOSING_COSTS_PCT
-    transfer = sale_price * DEFAULT_TRANSFER_TAX_PCT
+    transfer = calculate_transfer_tax(sale_price, state)
 
     return SellingCosts(
         agent_commission=round(commission),
@@ -678,7 +789,8 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
 def run_deal_analysis(address: str, city: str = "", state: str = "TN",
                       zip_code: str = "", purchase_price: float = 0,
                       rehab_tier: int = 2, exit_strategy: str = "flip",
-                      region: str = DEFAULT_REGION,
+                      region: str = DEFAULT_REGION, county: str = "",
+                      walkthrough_verified: bool = False,
                       radius: float = DEFAULT_RADIUS_MILES,
                       months: int = DEFAULT_MONTHS_BACK,
                       output_path: str = "") -> dict:
@@ -695,20 +807,37 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
 
     # Step 2: Fetch comps and calculate ARV
     comps = fetch_comparable_sales(subject, radius, months)
-    arv = calculate_arv(subject, comps)
+    # walkthrough_verified gates the reconfigure-to-more-bedrooms upside. Left
+    # False the upside is computed and shown but never priced into MAO.
+    arv = calculate_arv(subject, comps, walkthrough_verified=walkthrough_verified)
 
     if arv.confidence == "none":
-        logger.warning("No ARV could be calculated — insufficient comp data")
+        # Fail loud. Continuing here produced a fully-rendered, branded deal report
+        # in which ARV, MAO, and every projection were $0 — output that looks
+        # deliberate rather than broken. A missing ARV is not a degraded result,
+        # it is the absence of one.
+        logger.error(
+            "No ARV could be calculated from %d comp(s) — refusing to emit a deal "
+            "package. Reason: %s", len(comps),
+            arv.confidence_reason or "insufficient comp data")
+        return {
+            "error": "No ARV could be calculated — "
+                     f"{arv.confidence_reason or 'insufficient comp data'}",
+            "subject": subject,
+            "comps": comps,
+        }
 
     # Step 3: Rehab estimates
     rehab_full = estimate_rehab(
         address=subject.address, sqft=subject.sqft, bedrooms=subject.bedrooms,
         bathrooms=subject.bathrooms, year_built=subject.year_built,
         tier=rehab_tier, scope="full", region=region,
+        state=subject.state, county=county, city=subject.city,
     )
     rehab_wholetail = estimate_wholetail(
         address=subject.address, sqft=subject.sqft, bedrooms=subject.bedrooms,
         bathrooms=subject.bathrooms, year_built=subject.year_built, region=region,
+        state=subject.state, county=county, city=subject.city,
     )
 
     # Use purchase price or default to flip MAO
@@ -723,7 +852,7 @@ def run_deal_analysis(address: str, city: str = "", state: str = "TN",
     # Step 5: Projections
     rehab_months = rehab_full.total_weeks / 4.0  # weeks to months
     holding = calculate_holding_costs(purchase_price, rehab_months)
-    selling = calculate_selling_costs(arv.arv_mid)
+    selling = calculate_selling_costs(arv.arv_mid, state=subject.state)
 
     flip = calculate_flip(arv.arv_mid, purchase_price, rehab_full.grand_total,
                           holding, selling, rehab_months)

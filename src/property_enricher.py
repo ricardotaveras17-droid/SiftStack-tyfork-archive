@@ -24,7 +24,24 @@ PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
 REQUEST_DELAY_MIN = 1.0   # seconds between requests
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30       # seconds per API call (Zillow can be 0.5-4s+)
-MAX_RETRIES = 2
+MAX_RETRIES = 3
+
+# Upstream 5xx is the dominant failure mode: OpenWeb Ninja fronts Zillow and
+# returns 502/503/504 whenever its own upstream is degraded. These were already
+# retried before (raise_for_status raised into the handler below), but with no
+# delay at all, so both attempts landed inside the same outage instant. Handling
+# them explicitly buys a real wait between tries and a clearer log line. The
+# 2026-09-09 NJ run lost all 72 records to a sustained outage this way.
+RETRYABLE_STATUS = (429, 500, 502, 503, 504)
+RETRY_BACKOFF_BASE = 2.0   # seconds; waits are BASE * attempt (2s, 4s)
+
+# Per-run outcome counters, published module-level so callers can report WHY a
+# run came back empty without changing this function's return type (same idiom
+# as nj_sheriff_sales.LAST_STALE_DROPPED). A run that enriched nothing because
+# the API was down must not look like one where no property was in Zillow.
+LAST_RUN_STATS: dict = {
+    "enriched": 0, "not_found": 0, "api_errors": 0, "total": 0,
+}
 
 # ── Mapping tables ────────────────────────────────────────────────────
 
@@ -143,10 +160,6 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
             if resp.status_code == 404:
                 logger.debug("Zillow: no data for '%s'", full_address)
                 return None
-            if resp.status_code == 429:
-                logger.warning("Zillow rate limit hit -- waiting 10s (attempt %d)", attempt)
-                time.sleep(10)
-                continue
             if resp.status_code == 401:
                 # Auth error is permanent for this session — don't burn the retry
                 # budget. The pipeline-level counter will track how many records
@@ -155,6 +168,20 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
                     "Zillow 401 Unauthorized — OPENWEBNINJA_API_KEY invalid or expired (affects all enrichment)"
                 )
                 return None
+            if resp.status_code in RETRYABLE_STATUS:
+                if attempt >= MAX_RETRIES:
+                    logger.warning(
+                        "Zillow HTTP %d for '%s' -- giving up after %d attempts",
+                        resp.status_code, full_address, MAX_RETRIES,
+                    )
+                    return None
+                wait = 10.0 if resp.status_code == 429 else RETRY_BACKOFF_BASE * attempt
+                logger.warning(
+                    "Zillow HTTP %d for '%s' -- waiting %.1fs (attempt %d/%d)",
+                    resp.status_code, full_address, wait, attempt, MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
             resp.raise_for_status()
             body = resp.json()
             # OpenWeb Ninja wraps response in {"status": "OK", "data": {...}}
@@ -170,6 +197,11 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
             logger.warning("Zillow timeout for '%s' (attempt %d/%d)", full_address, attempt, MAX_RETRIES)
         except requests.RequestException as e:
             logger.warning("Zillow API error for '%s': %s (attempt %d/%d)", full_address, e, attempt, MAX_RETRIES)
+        # Timeout / connection error paths land here. Back off before the next
+        # attempt for the same reason as the 5xx branch above: retrying
+        # instantly just re-hits whatever is currently broken.
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_BACKOFF_BASE * attempt)
 
     return None
 
@@ -324,7 +356,15 @@ def enrich_properties(
 
     Returns:
         The same list (modified in-place) for chaining convenience.
+
+    Also refreshes module-level LAST_RUN_STATS so the caller can report the
+    outcome breakdown (enriched / not_found / api_errors) rather than just a
+    fill rate.
     """
+    LAST_RUN_STATS.update(
+        {"enriched": 0, "not_found": 0, "api_errors": 0, "total": 0}
+    )
+
     if not api_key:
         logger.info("OpenWeb Ninja API key not configured -- skipping Zillow enrichment")
         return notices
@@ -390,5 +430,9 @@ def enrich_properties(
         "Zillow enrichment: %d enriched, %d not in Zillow, %d API errors (%d total)%s",
         enriched, not_found, api_errors, len(eligible), avg_equity,
     )
+    LAST_RUN_STATS.update({
+        "enriched": enriched, "not_found": not_found,
+        "api_errors": api_errors, "total": len(eligible),
+    })
 
     return notices

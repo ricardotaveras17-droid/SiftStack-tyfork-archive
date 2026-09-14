@@ -73,12 +73,38 @@ async def _check_cloudflare_block(page, county_name: str) -> None:
     Fast pre-flight check after the first goto, before we burn 180+ days
     of timeouts hammering a blocked IP. The CF block page weighs ~5KB and
     has 'Cloudflare' in the <title>; the real Bluestone form is ~80KB+.
+
+    Cloudflare has TWO responses here and this used to catch only one:
+      - the BLOCK page, titled "Attention Required! | Cloudflare"
+      - the JS CHALLENGE interstitial, titled "Just a moment..." — the word
+        "Cloudflare" appears nowhere in its title
+    Somerset draws the second one on every headless run. The title check
+    missed it, so this pre-flight returned clean on a real block, the form
+    selectors then timed out against an interstitial, and the scraper
+    returned [] — reporting a Cloudflare block as "0 filings this week",
+    every week, for months. Body markers are checked too because CF varies
+    the title; the genuine Bluestone form carries none of them.
     """
     title = (await page.title()) or ""
-    if "Cloudflare" in title or "Attention Required" in title:
+    if (
+        "Cloudflare" in title
+        or "Attention Required" in title
+        or "Just a moment" in title
+    ):
         raise CloudflareBlockError(
             f"{county_name}: Cloudflare blocked the IP (title={title!r}). "
             f"Scraper skipped — other scrapers continue."
+        )
+    html = ((await page.content()) or "").lower()
+    hit = next(
+        (m for m in ("challenge-platform", "cf-browser-verification",
+                     "cf-chl", "checking your browser") if m in html),
+        None,
+    )
+    if hit:
+        raise CloudflareBlockError(
+            f"{county_name}: Cloudflare challenge detected (marker={hit!r}, "
+            f"title={title!r}). Scraper skipped — other scrapers continue."
         )
 
 
@@ -818,11 +844,30 @@ async def _somerset_extract_records(
                     continue
                 # Postback is async — wait for the detail panel to render.
                 await page.wait_for_timeout(3500)
+                # Read the DOM inside the try, with a short retry. The fixed
+                # pause above is a race: when a postback runs long,
+                # page.content() raises "page is navigating and changing the
+                # content". That used to escape this row loop and abort the
+                # whole scrape, which is why Somerset reported 0 records every
+                # week while the portal actually had 100+ filings. A slow row
+                # must skip, never kill the run.
+                detail_html = ""
+                for _attempt in range(3):
+                    try:
+                        detail_html = await page.content()
+                        break
+                    except Exception:
+                        await page.wait_for_timeout(1500)
+                if not detail_html:
+                    logger.warning(
+                        "%s: row %d detail content unavailable — skipping",
+                        cfg.name, ridx,
+                    )
+                    continue
             except Exception as e:
                 logger.warning("%s: detail postback row %d failed: %s", cfg.name, ridx, e)
                 continue
 
-            detail_html = await page.content()
             # Scope the detail-panel parsing to the case_detail_main panel so
             # we don't pick up search-form labels.
             scoped = _isolate_panel(detail_html, "ASPxPanel_case_detail_main")
@@ -1001,7 +1046,9 @@ async def run_middlesex_probate_scrape(
         from datasift_uploader import upload_to_datasift
         csv_infos = write_datasift_split_csvs(enriched, list_name="")
         upload_result = await upload_to_datasift(
+            # Explicit target list — upload_csv no longer derives one.
             csv_infos[0]["path"], enrich=True, skip_trace=True,
+            list_name="SiftStack",
         )
         result["upload"] = upload_result
 

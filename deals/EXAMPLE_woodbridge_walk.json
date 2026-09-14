@@ -1,0 +1,40 @@
+{
+  "_comment": "Anything filled in here OVERRIDES the live record. The person who stood in the house knows things the data does not.",
+  "walk_date": "2026-08-20",
+  "property": {
+    "address": "412 Rahway Ave", "city": "Woodbridge", "state": "NJ",
+    "zip": "07095", "county": "Middlesex",
+    "sqft": 1320, "beds": 2, "baths": 1.0, "year_built": 1948
+  },
+  "layout": "Cape. Two down, unfinished full-height second floor with a dormer already framed.",
+  "distress": "Estate sale. Vacant 14 months, roof leak at the rear dormer, knob-and-tube in the attic run.",
+  "unfinanceable": true,
+  "finish_tier": 2,
+  "scope": "full",
+  "exit_scope": "med",
+  "target_config": { "beds": 3, "baths": 2 },
+  "reconfig_verified": false,
+  "contract_price": 232000,
+  "assignment_price": 258000,
+  "as_is_value": 268000,
+  "monthly_rent": 2900,
+  "work_done": [
+    "Rear dormer framed and sheathed by the prior owner, permit on file and closed.",
+    "200A service already upgraded at the panel; the knob-and-tube is attic-only."
+  ],
+  "still_open": [
+    "Roof: full tear-off, the dormer flashing is the active leak.",
+    "Second floor is studs — no insulation, drywall, HVAC runs or egress window."
+  ],
+  "flags": [
+    "Knob-and-tube in the attic run must come out before any insulation goes in.",
+    "Oil tank status unknown — no closure letter in the file. Reserve $10-25k until swept."
+  ],
+  "gates": [
+    "Do not credit the 3-bed reconfigure until the second-floor egress window and ceiling height are measured."
+  ],
+  "financing": {
+    "rate": 0.12, "points": 2, "term_months": 9, "ltc": 0.85, "draws": 4,
+    "lender": "[LENDER]", "assumed": true
+  }
+}

@@ -15,6 +15,69 @@ import config as cfg
 
 logger = logging.getLogger(__name__)
 
+# ── Credential preflight ─────────────────────────────────────────────
+# A rotated key is present, well-formed, and rejected. Shape checks pass and prove nothing —
+# only a live call detects it. Without this, an auth failure arrives as a generic warning and
+# a None return, which is indistinguishable from "the model found nothing". That is how a dead
+# key went unnoticed across two projects (see 2026-08-18).
+
+_AUTH_DEAD = {"dead": False}   # set once an auth error is seen; later calls fail fast
+                               # (a dict cell, so no `global` declaration is needed —
+                               #  `global` after a read is a SyntaxError ast.parse misses)
+
+
+def preflight(verbose: bool = True) -> tuple[bool, str]:
+    """Prove the configured backend's credential works. -> (ok, actionable detail).
+
+    Call this at the start of any unattended run. Only checks the backend actually in use.
+    """
+    backend = getattr(cfg, "LLM_BACKEND", "anthropic")
+    if backend != "anthropic":
+        msg = f"backend is {backend!r}, not anthropic — no Anthropic credential needed"
+        if verbose:
+            logger.info("preflight: %s", msg)
+        return True, msg
+
+    key = cfg.ANTHROPIC_API_KEY
+    model = getattr(cfg, "LLM_MODEL", "claude-haiku-4-5-20251001")
+
+    if not key:
+        return False, ("ANTHROPIC_API_KEY is NOT SET. Add it to this project's gitignored "
+                       ".env, or run `ant auth login`.")
+    if not key.startswith("sk-ant-"):
+        return False, ("ANTHROPIC_API_KEY is set but malformed (no 'sk-ant-' prefix). "
+                       "Check for a truncated paste or stray quotes.")
+
+    import anthropic
+    try:
+        anthropic.Anthropic(api_key=key).messages.create(
+            model=model, max_tokens=4,
+            messages=[{"role": "user", "content": "ok"}])
+    except anthropic.AuthenticationError:
+        return False, (f"ANTHROPIC_API_KEY is present and well-formed but was REJECTED (401) "
+                       f"by the API — it has expired or been rotated. Put a current key in "
+                       f"this project's gitignored .env. NOTE: this key is shared with the "
+                       f"other SiftStack project and sms-loop; if it was rotated, update all "
+                       f"three.")
+    except anthropic.NotFoundError:
+        return False, (f"credential works, but model {model!r} was not found. Check LLM_MODEL "
+                       f"in .env against the current model list.")
+    except Exception as e:
+        return False, f"preflight could not complete: {type(e).__name__}: {e}"
+
+    msg = f"credential accepted (backend=anthropic, model={model})"
+    if verbose:
+        logger.info("preflight: %s", msg)
+    return True, msg
+
+
+def require_preflight() -> None:
+    """Preflight or exit. For scripts that should not start work on a dead credential."""
+    ok, detail = preflight()
+    if not ok:
+        raise SystemExit(f"PREFLIGHT FAILED — {detail}")
+
+
 # ── Backend dispatch ──────────────────────────────────────────────────
 
 
@@ -23,15 +86,10 @@ def chat_json(
     system: str = "",
     max_tokens: int = 1024,
     api_key: str | None = None,
-    model: str | None = None,
 ) -> dict | None:
     """Send prompt, get parsed JSON response. Routes to configured backend.
 
     Returns parsed dict on success, None on failure.
-
-    model: optional per-call Anthropic model override (e.g. a higher-quality
-    model for accuracy-critical extraction). Defaults to config.LLM_MODEL.
-    Ignored by the ollama / openrouter backends (they have their own model config).
     """
     backend = getattr(cfg, "LLM_BACKEND", "anthropic")
     if backend == "ollama":
@@ -39,7 +97,7 @@ def chat_json(
     elif backend == "openrouter":
         return _chat_openrouter(prompt, system, max_tokens)
     else:
-        return _chat_anthropic(prompt, system, max_tokens, api_key, model)
+        return _chat_anthropic(prompt, system, max_tokens, api_key)
 
 
 def chat_json_async(
@@ -47,7 +105,6 @@ def chat_json_async(
     system: str = "",
     max_tokens: int = 1024,
     api_key: str | None = None,
-    model: str | None = None,
 ):
     """Async version — returns a coroutine. For llm_parser.py compatibility."""
     import asyncio
@@ -57,7 +114,7 @@ def chat_json_async(
     elif backend == "openrouter":
         return _chat_openrouter_async(prompt, system, max_tokens)
     else:
-        return _chat_anthropic_async(prompt, system, max_tokens, api_key, model)
+        return _chat_anthropic_async(prompt, system, max_tokens, api_key)
 
 
 # ── Anthropic backend ────────────────────────────────────────────────
@@ -65,17 +122,18 @@ def chat_json_async(
 
 def _chat_anthropic(
     prompt: str, system: str, max_tokens: int, api_key: str | None,
-    model: str | None = None,
 ) -> dict | None:
-    """Call Claude via Anthropic API (sync). model overrides config.LLM_MODEL."""
+    """Call Claude Haiku via Anthropic API (sync)."""
     import anthropic
 
     key = api_key or cfg.ANTHROPIC_API_KEY
+    if _AUTH_DEAD["dead"]:
+        return None          # key already proven dead this run; do not retry
     if not key:
         logger.warning("No Anthropic API key — skipping LLM call")
         return None
 
-    model = model or getattr(cfg, "LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = getattr(cfg, "LLM_MODEL", "claude-haiku-4-5-20251001")
     try:
         client = anthropic.Anthropic(api_key=key)
         response = client.messages.create(
@@ -86,29 +144,35 @@ def _chat_anthropic(
         )
         result_text = response.content[0].text.strip()
         return _parse_json(result_text)
-    except anthropic.NotFoundError as e:
-        # Almost always a bad/retired model id. Surface loudly: silently returning
-        # None here makes downstream extraction (e.g. heir maps) collapse to empty.
-        logger.error("Anthropic rejected model %r (NotFoundError): %s", model, e)
+    except anthropic.AuthenticationError as e:
+        # Not a transient failure — every later call will fail the same way.
+        if not _AUTH_DEAD['dead']:
+            _AUTH_DEAD['dead'] = True
+            logger.error(
+                "ANTHROPIC KEY REJECTED (401) — every LLM call in this run will "
+                "return nothing. The key is set but expired or rotated. Fix it in "
+                "this project's .env (shared with the other SiftStack project and "
+                "sms-loop). Underlying error: %s", e)
         return None
     except Exception as e:
-        logger.warning("Anthropic LLM call failed (model=%s): %s", model, e)
+        logger.warning("Anthropic LLM call failed: %s", e)
         return None
 
 
 async def _chat_anthropic_async(
     prompt: str, system: str, max_tokens: int, api_key: str | None,
-    model: str | None = None,
 ) -> dict | None:
-    """Call Claude via Anthropic API (async). model overrides config.LLM_MODEL."""
+    """Call Claude Haiku via Anthropic API (async)."""
     import anthropic
 
     key = api_key or cfg.ANTHROPIC_API_KEY
+    if _AUTH_DEAD["dead"]:
+        return None          # key already proven dead this run; do not retry
     if not key:
         logger.warning("No Anthropic API key — skipping LLM call")
         return None
 
-    model = model or getattr(cfg, "LLM_MODEL", "claude-haiku-4-5-20251001")
+    model = getattr(cfg, "LLM_MODEL", "claude-haiku-4-5-20251001")
     try:
         client = anthropic.AsyncAnthropic(api_key=key)
         response = await client.messages.create(
@@ -119,11 +183,18 @@ async def _chat_anthropic_async(
         )
         result_text = response.content[0].text.strip()
         return _parse_json(result_text)
-    except anthropic.NotFoundError as e:
-        logger.error("Anthropic rejected model %r (NotFoundError): %s", model, e)
+    except anthropic.AuthenticationError as e:
+        # Not a transient failure — every later call will fail the same way.
+        if not _AUTH_DEAD['dead']:
+            _AUTH_DEAD['dead'] = True
+            logger.error(
+                "ANTHROPIC KEY REJECTED (401) — every LLM call in this run will "
+                "return nothing. The key is set but expired or rotated. Fix it in "
+                "this project's .env (shared with the other SiftStack project and "
+                "sms-loop). Underlying error: %s", e)
         return None
     except Exception as e:
-        logger.warning("Anthropic async LLM call failed (model=%s): %s", model, e)
+        logger.warning("Anthropic async LLM call failed: %s", e)
         return None
 
 

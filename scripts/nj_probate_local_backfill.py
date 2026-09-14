@@ -23,6 +23,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
+# Why each source came back empty, from the last _scrape_all. A source that
+# was BLOCKED must never render as a bare "0 notices" — that is the exact
+# silent zero that hid Somerset's Cloudflare block for months.
+SOURCE_ERRORS: dict[str, str] = {}
+
+
+def _status_line(label: str, count: int) -> str:
+    """One summary line that can never hide a failure behind a zero.
+
+    Three distinct states that all used to print as "0 notices":
+      BLOCKED/FAILED  - the scraper never got to look. Re-run recovers it.
+      clean zero      - the scraper ran fine and the county filed nothing.
+      normal          - records found.
+    """
+    err = SOURCE_ERRORS.get(label)
+    if err:
+        return f"  :red_circle: {label}: {count} notices — {err}"
+    if count == 0:
+        return f"  :warning: {label}: 0 notices (ran clean — verify the county really filed nothing)"
+    return f"  {label}: {count} notices"
+
+
 async def _scrape_all(
     mx_days_back: int, som_days_back: int, ocean_days_back: int, headless: bool,
 ):
@@ -37,21 +59,63 @@ async def _scrape_all(
         scrape_middlesex_probates,
         scrape_somerset_probates,
         scrape_ocean_probates,
+        CloudflareBlockError,
     )
+
+    SOURCE_ERRORS.clear()
 
     logger = logging.getLogger("nj_probate_backfill")
 
+    async def _safe(label, coro):
+        """Run one scraper; never let its failure discard the others' work.
+
+        Mirrors modal_app's _safe wrapper. This script is what you reach for
+        when something has ALREADY gone wrong, so a crash in a later source
+        must not throw away an earlier one: on 2026-09-10 a Playwright error
+        in Somerset discarded 1,042 successfully scraped Middlesex records
+        and 27 minutes of wall-clock.
+        """
+        try:
+            out = await coro
+            logger.info("%s: %d notices", label, len(out))
+            return out
+        except CloudflareBlockError as e:
+            SOURCE_ERRORS[label] = f"BLOCKED (Cloudflare) — {e}"
+            logger.error("%s BLOCKED by Cloudflare — continuing with other sources: %s",
+                         label, e)
+            return []
+        except Exception as e:
+            SOURCE_ERRORS[label] = f"FAILED ({type(e).__name__}) — {e}"
+            logger.error("%s FAILED (%s: %s) — continuing with other sources",
+                         label, type(e).__name__, e)
+            return []
+
     logger.info("Middlesex: %d days DoD scan", mx_days_back)
-    mx = await scrape_middlesex_probates(days_back=mx_days_back, headless=headless)
-    logger.info("Middlesex: %d notices", len(mx))
+    mx = await _safe(
+        "Middlesex",
+        scrape_middlesex_probates(days_back=mx_days_back, headless=headless),
+    )
 
     logger.info("Somerset: %d days file-date scan", som_days_back)
-    som = await scrape_somerset_probates(days_back=som_days_back, headless=headless)
-    logger.info("Somerset: %d notices", len(som))
+    som = await _safe(
+        "Somerset",
+        scrape_somerset_probates(days_back=som_days_back, headless=headless),
+    )
 
-    logger.info("Ocean: %d days DoD scan", ocean_days_back)
-    ocean = await scrape_ocean_probates(days_back=ocean_days_back, headless=headless)
-    logger.info("Ocean: %d notices", len(ocean))
+    # Ocean is OFF by default, matching modal_app's weekly cron, which
+    # deliberately does not import or run it: those leads are parked until
+    # the team has capacity to work them. Running it anyway cost ~27 minutes
+    # of scraping per backfill for data nobody reads. Pass --include-ocean
+    # to turn it back on.
+    if ocean_days_back > 0:
+        logger.info("Ocean: %d days DoD scan", ocean_days_back)
+        ocean = await _safe(
+            "Ocean",
+            scrape_ocean_probates(days_back=ocean_days_back, headless=headless),
+        )
+    else:
+        logger.info("Ocean: skipped (parked — pass --include-ocean to run)")
+        ocean = []
 
     return mx, som, ocean
 
@@ -62,6 +126,8 @@ def main() -> int:
                    help="Middlesex DoD window (default 180)")
     p.add_argument("--som-days-back", type=int, default=30,
                    help="Somerset file-date window (default 30)")
+    p.add_argument("--include-ocean", action="store_true",
+                   help="Also scrape Ocean (parked by default, matches the weekly cron)")
     p.add_argument("--ocean-days-back", type=int, default=180,
                    help="Ocean DoD window (default 180)")
     p.add_argument("--headed", action="store_true", help="Show browser windows")
@@ -81,7 +147,7 @@ def main() -> int:
     mx, som, ocean = asyncio.run(_scrape_all(
         mx_days_back=args.mx_days_back,
         som_days_back=args.som_days_back,
-        ocean_days_back=args.ocean_days_back,
+        ocean_days_back=args.ocean_days_back if args.include_ocean else 0,
         headless=not args.headed,
     ))
     combined = mx + som + ocean
@@ -126,22 +192,35 @@ def main() -> int:
         for info in csv_infos:
             logger.info("DataSift uploading %s ...", info["path"].name)
             asyncio.run(upload_to_datasift(
+                # Explicit target list — upload_csv no longer derives one.
                 info["path"], enrich=True, skip_trace=True,
+                list_name="SiftStack",
             ))
 
     if args.notify_slack and config.SLACK_WEBHOOK_URL:
         from slack_notifier import _send_webhook
+        header = (":rotating_light: NJ PROBATE BACKFILL — SOURCE FAILURE\n"
+                  if SOURCE_ERRORS else "")
         lines = [
-            f"*NJ Probate Local Backfill — Middlesex {args.mx_days_back}d + Somerset {args.som_days_back}d + Ocean {args.ocean_days_back}d*",
-            f"  Middlesex: {len(mx)} notices",
-            f"  Somerset: {len(som)} notices",
-            f"  Ocean: {len(ocean)} notices",
+            header + f"*NJ Probate Local Backfill — Middlesex {args.mx_days_back}d + Somerset {args.som_days_back}d"
+            + (f" + Ocean {args.ocean_days_back}d*" if args.include_ocean else "*"),
+            _status_line("Middlesex", len(mx)),
+            _status_line("Somerset", len(som)),
+            (_status_line("Ocean", len(ocean)) if args.include_ocean
+             else "  Ocean: skipped"),
             f"Enriched total: {len(enriched)}",
             f"CSV: {csv_path.name}",
         ]
         if held_back:
             lines.append(f":pause_button: Held for cleaning: {len(held_back)} (probate paused)")
         _send_webhook("\n".join(lines))
+
+    # Non-zero when ANY source failed, even though others succeeded and a CSV
+    # was written. The scheduled job keys its alert off this: a partial run
+    # that quietly returns 0 is how a blocked scraper stays invisible.
+    if SOURCE_ERRORS:
+        logger.error("Sources failed: %s", ", ".join(sorted(SOURCE_ERRORS)))
+        return 2
 
     return 0
 

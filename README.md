@@ -1,4 +1,18 @@
-# SiftStack
+# SiftStack — Rick's live operations platform
+
+> **Which SiftStack is this?** Three copies of this platform live on this Mac and all three
+> READMEs used to open with the same line. This is **Rick's own working platform**: NJ probate
+> pulls (`com.rick.nj-probate`), call coaching under `src/call_coaching/`, and the enrichment
+> pipeline. 144 commits, the most diverged of the three.
+>
+> - `~/Desktop/siftstack-upstream` — **Ty's**, remote `DataSift-Ty-Personal/SiftStack`. Pull-only.
+>   Its `install.py` overwrites live skills in `~/.claude/skills` and deletes its own backup;
+>   never run it bare. See that repo's `WHAT-THIS-IS.md`.
+> - `~/Desktop/SiftStack-DNT` — Rick's standalone copy from 2026-08-17. Owns the sold sweep
+>   (`com.rick.sold-sweep-dryrun`). **Its `deep_prospecting/` has drifted from this one** —
+>   `sources/cbc.py`, `phases/phase_1_title.py`, `_utils.py` and `datasift_csv_writer.py` all
+>   differ. This copy is the one being actively fixed; fix here, not there.
+
 
 Full-stack real estate investing operations platform built for [DataSift.ai](https://datasift.ai). Pulls data from any source — web scrapes, scanned PDFs, courthouse terminal photos, Dropbox uploads — standardizes everything through a 10-step enrichment pipeline, and pushes it directly into DataSift ready for niche sequential marketing.
 

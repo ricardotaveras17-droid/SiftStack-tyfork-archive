@@ -955,6 +955,10 @@ def _run_csv_import(args) -> None:
                     csv_infos[0]["path"],
                     enrich=do_enrich,
                     skip_trace=do_skip_trace,
+                    # Explicit target list — upload_csv no longer derives one.
+                    # NOTE: --list-name still only reaches the CSV's Lists column,
+                    # not the wizard. Unchanged here on purpose.
+                    list_name="SiftStack",
                 )
             )
 
@@ -1704,8 +1708,20 @@ def cli_main() -> None:
                         help="Finish tier 1-4 (rehab mode, default: 2)")
     parser.add_argument("--scope", type=str, default="full", choices=["full", "wholetail"],
                         help="Rehab scope (rehab mode, default: full)")
-    parser.add_argument("--region", type=str, default="knoxville",
-                        help="Regional pricing (rehab mode, default: knoxville)")
+    parser.add_argument("--region", type=str, default="",
+                        help="Explicit cost region (rehab/analyze-deal). Omit to "
+                             "resolve from --state + --county/--city. There is no "
+                             "default: an unresolvable region is an error, not a "
+                             "silent fall back to national average.")
+    parser.add_argument("--state", type=str, default="",
+                        help="Two-letter state, used to resolve the cost region")
+    parser.add_argument("--walkthrough-verified", action="store_true",
+                        help="A walkthrough confirmed the layout converts "
+                             "(plumbing runs, egress, framing, ceiling heights). "
+                             "Only then is the reconfigure upside credited.")
+    parser.add_argument("--county", type=str, default="",
+                        help="County name, used to resolve the cost region "
+                             "(rehab/analyze-deal modes)")
     parser.add_argument("--sqft", type=int, default=0,
                         help="Property sqft override (rehab mode)")
     parser.add_argument("--bedrooms", type=int, default=0,
@@ -1819,12 +1835,17 @@ def cli_main() -> None:
         if not args.address:
             print("ERROR: --address is required for rehab mode")
             return
-        from rehab_estimator import run_rehab_estimate
-        result = run_rehab_estimate(
-            address=args.address, sqft=args.sqft, bedrooms=args.bedrooms or 3,
-            bathrooms=args.bathrooms or 2.0, tier=args.tier, scope=args.scope,
-            region=args.region,
-        )
+        from rehab_estimator import UnknownRegionError, run_rehab_estimate
+        try:
+            result = run_rehab_estimate(
+                address=args.address, sqft=args.sqft, bedrooms=args.bedrooms or 3,
+                bathrooms=args.bathrooms or 2.0, tier=args.tier, scope=args.scope,
+                region=args.region, state=args.state, county=args.county,
+                city=args.city or "",
+            )
+        except (UnknownRegionError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
         full = result["full_estimate"]
         wt = result["wholetail_estimate"]
         print(f"Rehab report: {result['report_path']}")
@@ -1837,12 +1858,19 @@ def cli_main() -> None:
             print("ERROR: --address is required for analyze-deal mode")
             return
         from deal_analyzer import run_deal_analysis
-        result = run_deal_analysis(
-            address=args.address, city=args.city or "", zip_code=args.zip_code or "",
-            purchase_price=args.purchase_price, rehab_tier=args.rehab_tier,
-            exit_strategy=args.exit_strategy, region=args.region,
-            radius=args.radius, months=args.months,
-        )
+        from rehab_estimator import UnknownRegionError
+        try:
+            result = run_deal_analysis(
+                address=args.address, city=args.city or "", zip_code=args.zip_code or "",
+                purchase_price=args.purchase_price, rehab_tier=args.rehab_tier,
+                exit_strategy=args.exit_strategy, region=args.region,
+                county=args.county,
+                walkthrough_verified=args.walkthrough_verified,
+                radius=args.radius, months=args.months,
+            )
+        except (UnknownRegionError, ValueError) as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
         if "error" in result:
             logger.error("Deal analysis failed: %s", result["error"])
         else:
@@ -2219,6 +2247,10 @@ def _run_scrape_pipeline(args, searches) -> None:
                     csv_infos[0]["path"],
                     enrich=do_enrich,
                     skip_trace=do_skip_trace,
+                    # Explicit target list — upload_csv no longer derives one.
+                    # NOTE: --list-name still only reaches the CSV's Lists column,
+                    # not the wizard. Unchanged here on purpose.
+                    list_name="SiftStack",
                 )
             )
 

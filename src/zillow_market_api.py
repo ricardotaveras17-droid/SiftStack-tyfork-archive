@@ -43,13 +43,46 @@ MIN_BAND_WIDTH = 4000    # stop splitting price bands narrower than this
 REQUEST_DELAY = 0.8
 MAX_RETRIES = 3
 
-# Default price bands for the adaptive sold pull. Any band that comes back
-# saturated (>= RESULT_CAP) is split in half recursively.
-DEFAULT_BANDS = [
+# Price bands for the adaptive sold pull. Any band that comes back saturated
+# (>= RESULT_CAP) is split in half recursively, and every split is another
+# metered call -- so bands tuned to the wrong price distribution cost real
+# money. The Tennessee set below concentrates resolution under $420k; run it
+# against a North Jersey zip and the top band swallows most of the market and
+# recurses for many calls before it resolves.
+TN_BANDS = [
     (1_000, 100_000), (100_001, 160_000), (160_001, 210_000),
     (210_001, 250_000), (250_001, 290_000), (290_001, 340_000),
     (340_001, 420_000), (420_001, 3_000_000),
 ]
+
+# North Jersey: Essex / Union / Middlesex / Somerset. Resolution is
+# concentrated across $285k-$640k where the volume actually sits, with a
+# distressed floor band and an open top for Summit / Westfield / Montclair.
+NJ_BANDS = [
+    (1_000, 150_000), (150_001, 225_000), (225_001, 285_000),
+    (285_001, 340_000), (340_001, 400_000), (400_001, 465_000),
+    (465_001, 540_000), (540_001, 640_000), (640_001, 800_000),
+    (800_001, 5_000_000),
+]
+
+BANDS_BY_STATE = {"NJ": NJ_BANDS, "TN": TN_BANDS}
+DEFAULT_BANDS = TN_BANDS          # kept for callers that import it by name
+
+
+def bands_for(state: str = "", bands: list | None = None) -> list:
+    """Price bands for a market. Explicit bands win; unknown states fall back
+    to the national-ish TN spread with a warning, because silently banding a
+    market you have not tuned for is how a pull costs 3x the calls it should."""
+    if bands:
+        return bands
+    key = (state or "").strip().upper()
+    if key in BANDS_BY_STATE:
+        return BANDS_BY_STATE[key]
+    if key:
+        logger.warning("No price bands tuned for state %r — using the TN spread. "
+                       "Expect extra recursive splits (and extra metered calls) "
+                       "if this market prices differently.", key)
+    return TN_BANDS
 
 
 @dataclass
@@ -161,12 +194,14 @@ class ZillowMarketAPI:
         return items
 
     def pull_sold(self, location: str, months_back: int = 12,
-                  houses_only: bool = True) -> list[MarketListing]:
+                  houses_only: bool = True, state: str = "",
+                  bands: list | None = None) -> list[MarketListing]:
         """Pull sold history via adaptive price-band partitioning.
 
         A single RECENTLY_SOLD search caps at 41 rows; banding by price and
         splitting saturated bands recovers roughly the last 2-3 years in a
-        typical Knox County zip.
+        typical zip. Pass ``state`` so the bands match the market's price
+        distribution; mis-tuned bands still work but cost extra calls.
         """
         collected: dict[str, dict] = {}
 
@@ -182,7 +217,7 @@ class ZillowMarketAPI:
                     collected[str(item.get("zpid"))] = item
             time.sleep(REQUEST_DELAY)
 
-        for lo, hi in DEFAULT_BANDS:
+        for lo, hi in bands_for(state, bands):
             pull_band(lo, hi)
 
         cutoff = (datetime.now() - timedelta(days=months_back * 30)).strftime("%Y-%m-%d")

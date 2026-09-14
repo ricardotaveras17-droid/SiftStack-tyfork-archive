@@ -14,6 +14,7 @@ Usage:
 
 import logging
 import math
+import statistics
 import random
 import time
 from dataclasses import dataclass, field
@@ -30,8 +31,8 @@ logger = logging.getLogger(__name__)
 # ── API Configuration ─────────────────────────────────────────────────
 API_BASE = "https://api.openwebninja.com/realtime-zillow-data"
 PROPERTY_ENDPOINT = f"{API_BASE}/property-details-address"
-# similar-sale-homes was retired by OpenWeb Ninja (404) — comps now come from
-# /search via zillow_market_api (see fetch_comparable_sales)
+# similar-sale-homes was RETIRED by OpenWeb Ninja (404 as of 2026-07).
+# Comps come from /search via zillow_market_api — see fetch_comparable_sales.
 REQUEST_DELAY_MIN = 1.0
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30
@@ -110,6 +111,8 @@ class CompProperty:
     ppsf: float = 0.0
     bucket: str = ""  # "A" (non-disclosure baseline) or "B" (disclosure/adjusted)
     adjustments: dict = field(default_factory=dict)
+    zestimate: float = 0.0
+    condition: str = ""   # RENOVATED/RETAIL | AVERAGE | DISTRESSED | UNKNOWN
 
 
 @dataclass
@@ -127,6 +130,18 @@ class ARVResult:
     bucket_b_count: int = 0
     avg_adjustment: float = 0.0
     spread_pct: float = 0.0
+    # ── Dual-track (bedroom band) ─────────────────────────────────────
+    # arv_mid IS arv_base. MAO and every projection come off the base track;
+    # the upside is shown, never bid off.
+    arv_base: float = 0.0
+    arv_upside: float = 0.0
+    upside_credited: bool = False
+    same_bed_count: int = 0
+    upside_comp_count: int = 0
+    band_median: float = 0.0
+    band_clamped: bool = False
+    band_flag: str = ""
+    basis: str = ""
 
 
 # ── Distance calculation ──────────────────────────────────────────────
@@ -223,22 +238,49 @@ def fetch_subject_property(address: str, city: str = "", state: str = "TN",
 
 def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAULT_RADIUS_MILES,
                            months_back: int = DEFAULT_MONTHS_BACK,
-                           api_key: str = "") -> list[CompProperty]:
-    """Fetch comparable sold properties near the subject property.
+                           api_key: str = "", bbox: tuple | None = None,
+                           street_pattern=None) -> list[CompProperty]:
+    """Fetch comparable sold properties near the subject.
 
     The original ``similar-sale-homes`` endpoint was retired by OpenWeb Ninja
-    (404 as of 2026-07). Comps now come from ``/search`` RECENTLY_SOLD via
-    ``zillow_market_api`` (adaptive price-band partitioning to beat the
-    41-result cap), filtered by haversine radius around the subject.
+    (404 as of 2026-07), which left this function returning nothing and the
+    whole comp path dead. Comps now come from ``/search`` RECENTLY_SOLD via
+    ``zillow_market_api``, which beats the 41-row per-search cap by partitioning
+    on price bands and recursively splitting any band that comes back saturated.
+
+    Three filters, applied in order and all optional beyond the first:
+      * haversine radius around the subject
+      * ``bbox`` — (lat_min, lat_max, lon_min, lon_max), a drawn boundary
+      * ``street_pattern`` — a compiled regex over the street address
+
+    The bbox and street clip are BOTH applied when supplied. A radius alone
+    crosses value pockets in dense NJ municipalities; the Mixed-Zip Watch List
+    in ``DNT Brain/Skills-Reference/comping/nj-adjustments.md`` names the zips
+    where that matters and is the reason to pass a boundary here.
     """
-    from zillow_market_api import ZillowMarketAPI
+    from zillow_market_api import ZillowMarketAPI, filter_bbox, filter_streets
 
     api_key = api_key or config.OPENWEBNINJA_API_KEY
     if not api_key:
+        logger.error("OPENWEBNINJA_API_KEY is not configured — cannot pull comps")
         return []
 
     location = f"{subject.city}, {subject.state} {subject.zip_code}".strip(", ")
-    listings = ZillowMarketAPI(api_key).pull_sold(location, months_back=months_back)
+    if not location.strip(", "):
+        logger.error("Subject has no city/state/zip — nothing to search on")
+        return []
+
+    listings = ZillowMarketAPI(api_key).pull_sold(
+        location, months_back=months_back, state=subject.state)
+
+    if bbox:
+        before = len(listings)
+        listings = filter_bbox(listings, *bbox)
+        logger.info("Boundary bbox: %d -> %d listings", before, len(listings))
+    if street_pattern is not None:
+        before = len(listings)
+        listings = filter_streets(listings, street_pattern)
+        logger.info("Boundary street clip: %d -> %d listings", before, len(listings))
 
     comps = []
     for listing in listings:
@@ -253,7 +295,7 @@ def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAU
         comp = CompProperty(
             address=listing.address,
             city=listing.city,
-            state=listing.state or "TN",
+            state=listing.state or subject.state,
             zip_code=listing.zip_code,
             latitude=listing.latitude,
             longitude=listing.longitude,
@@ -267,6 +309,8 @@ def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAU
             sold_price=listing.price,
             sold_date=listing.sold_date,
             days_on_market=listing.days_on_zillow,
+            zestimate=listing.zestimate,
+            garage_spaces=int(listing.raw.get("garageSpaces") or 0),
         )
         comp.ppsf = round(comp.sold_price / comp.sqft, 2) if comp.sqft else 0.0
         comps.append(comp)
@@ -274,10 +318,18 @@ def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAU
     logger.info("Fetched %d comparable sales within %.1f mi (last %d months)",
                 len(comps), radius_miles, months_back)
 
-    if len(comps) < MIN_COMPS and months_back < MAX_MONTHS_BACK:
-        logger.info("Only %d comps — retrying with %d-month window", len(comps), MAX_MONTHS_BACK)
-        return fetch_comparable_sales(subject, min(radius_miles * 1.5, MAX_RADIUS_MILES),
-                                      MAX_MONTHS_BACK, api_key)
+    # Real expansion, not a stub. The previous version logged that it was
+    # expanding and then executed `pass`, so a thin comp set never actually
+    # widened and the log said otherwise.
+    if len(comps) < MIN_COMPS and (radius_miles < MAX_RADIUS_MILES
+                                   or months_back < MAX_MONTHS_BACK):
+        new_radius = min(radius_miles * 1.5, MAX_RADIUS_MILES)
+        new_months = min(months_back + 3, MAX_MONTHS_BACK)
+        if new_radius > radius_miles or new_months > months_back:
+            logger.info("Only %d comps — expanding to %.1f mi / %d months",
+                        len(comps), new_radius, new_months)
+            return fetch_comparable_sales(subject, new_radius, new_months, api_key,
+                                          bbox, street_pattern)
 
     return comps
 
@@ -422,6 +474,129 @@ def _apply_adjustments(comp: CompProperty, adjustments: dict) -> float:
     return comp.sold_price + total_adj
 
 
+# ── Dual-track ARV: the bedroom band ─────────────────────────────────
+# Bedroom count is a value BAND, not a linear adjustment. A subject below the
+# comp set's bed count lives in a materially lower band than a per-bedroom
+# adjustment implies, and extra square footage does not lift it out -- the
+# buyer pool and the appraisal band both shift at the bedroom break.
+#
+# This runs BEFORE the Two-Bucket weighting and decides which comps are even
+# eligible. Two-Bucket then weights by source quality WITHIN the band; it never
+# reaches across one. Mirrors the Bedroom Band Rule in the real-estate-comping
+# skill and nj-adjustments.md -- if the rule changes, change it in both.
+
+RETAIL_ZEST_RATIO = 0.90        # sold >= 90% of Zestimate reads as renovated
+DISTRESSED_ZEST_RATIO = 0.70
+THIN_BAND_MIN_COMPS = 3         # below this, widen +/-1 bed and discount
+THIN_BAND_DISCOUNT = 0.90
+UPSIDE_SQFT_MIN, UPSIDE_SQFT_MAX = 0.60, 1.40
+UPSIDE_PERCENTILE = 0.75
+
+
+def classify_condition(comp: CompProperty) -> str:
+    """Bucket a sold comp by condition using sold price against Zestimate."""
+    if not comp.zestimate or not comp.sold_price:
+        return "UNKNOWN"
+    ratio = comp.sold_price / comp.zestimate
+    if ratio >= RETAIL_ZEST_RATIO:
+        return "RENOVATED/RETAIL"
+    if ratio <= DISTRESSED_ZEST_RATIO:
+        return "DISTRESSED"
+    return "AVERAGE"
+
+
+def _percentile(values: list, pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, int(round(pct * (len(ordered) - 1))))
+    return ordered[idx]
+
+
+def _retail_pool(comps: list) -> tuple:
+    """Renovated/retail comps, and a flag when condition could not be judged.
+
+    Without a Zestimate every comp classifies UNKNOWN, which would empty the
+    pool and silently produce no ARV. Falling back to the full set is the right
+    call, but it has to be visible in the basis string rather than assumed.
+    """
+    for c in comps:
+        c.condition = classify_condition(c)
+    retail = [c for c in comps if c.condition == "RENOVATED/RETAIL" and c.sqft and c.sold_price]
+    if retail:
+        return retail, ""
+    usable = [c for c in comps if c.sqft and c.sold_price]
+    if any(c.zestimate for c in comps):
+        return usable, "no renovated comps found — using the full set, condition unadjusted"
+    return usable, "no Zestimates available — condition bucketing skipped entirely"
+
+
+def dual_track_arv(subject: SubjectProperty, comps: list,
+                   walkthrough_verified: bool = False) -> dict:
+    """Split the comp set by bedroom band. Returns base and upside tracks.
+
+    Base track is what you underwrite and contract against. Upside is the
+    reconfigure-to-more-bedrooms number, and it is the BUYER's room until a
+    walkthrough proves the layout converts.
+    """
+    retail, pool_flag = _retail_pool(comps)
+    if not retail or not subject.sqft:
+        return {"base": None, "upside": None, "flag": pool_flag or
+                "no usable comps, or subject square footage is unknown",
+                "same_bed": [], "upside_comps": []}
+
+    same_bed = [c for c in retail if c.bedrooms == subject.bedrooms]
+    band_flag = pool_flag
+    base_pool = same_bed
+    discount = 1.0
+
+    if len(same_bed) < THIN_BAND_MIN_COMPS:
+        widened = [c for c in retail if abs(c.bedrooms - subject.bedrooms) <= 1]
+        if widened:
+            base_pool = widened
+            discount = THIN_BAND_DISCOUNT
+            extra = (f"THIN same-bed set ({len(same_bed)} comps) — widened to "
+                     f"+/-1 bed and discounted "
+                     f"{round((1 - THIN_BAND_DISCOUNT) * 100)}%")
+            band_flag = f"{band_flag}; {extra}" if band_flag else extra
+
+    base = None
+    if base_pool:
+        ppsf_values = [c.ppsf for c in base_pool if c.ppsf]
+        prices = [c.sold_price for c in base_pool if c.sold_price]
+        median_ppsf = statistics.median(ppsf_values) if ppsf_values else 0.0
+        band_median = statistics.median(prices) if prices else 0.0
+        base = {
+            "pool": base_pool,
+            "median_ppsf": median_ppsf,
+            "band_median": band_median,
+            "ppsf_estimate": median_ppsf * subject.sqft,
+            "discount": discount,
+            "n": len(base_pool),
+            "same_bed_n": len(same_bed),
+        }
+
+    upside_comps = [c for c in retail
+                    if c.bedrooms > subject.bedrooms
+                    and UPSIDE_SQFT_MIN <= (c.sqft / subject.sqft) <= UPSIDE_SQFT_MAX]
+    upside = None
+    if upside_comps:
+        ppsf_values = [c.ppsf for c in upside_comps if c.ppsf]
+        prices = [c.sold_price for c in upside_comps if c.sold_price]
+        est = (statistics.median(ppsf_values) * subject.sqft) if ppsf_values else 0.0
+        cap = _percentile(prices, UPSIDE_PERCENTILE)
+        upside = {
+            "pool": upside_comps,
+            "estimate": min(est, cap) if cap else est,
+            "cap_p75": cap,
+            "n": len(upside_comps),
+            "credited": walkthrough_verified,
+        }
+
+    return {"base": base, "upside": upside, "flag": band_flag,
+            "same_bed": same_bed, "upside_comps": upside_comps}
+
+
 # ── Two-Bucket classification ────────────────────────────────────────
 
 def _classify_bucket(comp: CompProperty) -> str:
@@ -445,7 +620,8 @@ def _classify_bucket(comp: CompProperty) -> str:
 
 # ── ARV calculation ───────────────────────────────────────────────────
 
-def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVResult:
+def calculate_arv(subject: SubjectProperty, comps: list[CompProperty],
+                  walkthrough_verified: bool = False) -> ARVResult:
     """Calculate After Repair Value using Two-Bucket methodology.
 
     1. Score and rank comps by similarity
@@ -456,14 +632,22 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
     if not comps:
         return ARVResult(confidence="none", confidence_reason="No comparable sales found")
 
-    # Score and sort by similarity
-    for comp in comps:
+    # ── Bedroom band first. It decides which comps are ELIGIBLE; the
+    # Two-Bucket weighting below then runs inside the band and never across it.
+    tracks = dual_track_arv(subject, comps, walkthrough_verified)
+    base_track, upside_track = tracks["base"], tracks["upside"]
+    band_flag = tracks["flag"]
+
+    band_pool = base_track["pool"] if base_track else comps
+
+    # Score and sort by similarity, within the band
+    for comp in band_pool:
         comp.similarity_score = _score_similarity(subject, comp)
 
-    comps.sort(key=lambda c: c.similarity_score, reverse=True)
+    band_pool.sort(key=lambda c: c.similarity_score, reverse=True)
 
     # Take top comps
-    selected = comps[:MAX_COMPS]
+    selected = band_pool[:MAX_COMPS]
 
     # Classify buckets and calculate adjustments
     for comp in selected:
@@ -505,6 +689,23 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
     else:
         arv_mid = bucket_a_avg
 
+    # ── The clamp. An oversized subject still sells to the same buyer pool,
+    # so the quality-weighted estimate can never exceed the middle of its own
+    # bedroom band. This is the whole point of the band rule: a linear
+    # per-bedroom adjustment would let it sail past.
+    band_median = base_track["band_median"] if base_track else 0.0
+    band_clamped = False
+    if band_median and arv_mid > band_median:
+        arv_mid = band_median
+        band_clamped = True
+    if base_track and base_track["discount"] < 1.0:
+        arv_mid *= base_track["discount"]
+
+    arv_base = arv_mid          # arv_mid IS the base track. MAO comes off this.
+
+    arv_upside = round(upside_track["estimate"]) if upside_track else 0.0
+    upside_credited = bool(upside_track and upside_track["credited"])
+
     # Confidence bands based on comp spread
     spread = max(adj_prices) - min(adj_prices)
     spread_pct = (spread / arv_mid * 100) if arv_mid else 0
@@ -533,6 +734,27 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
 
     avg_adj = sum(abs(sum(c.adjustments.values())) for c in selected) / len(selected) if selected else 0
 
+    same_bed_n = base_track["same_bed_n"] if base_track else 0
+    basis_parts = [f"{subject.bedrooms}-bed band",
+                   f"{same_bed_n} same-bed comp(s)"]
+    if band_clamped:
+        basis_parts.append(f"clamped to band median ${band_median:,.0f}")
+    if base_track and base_track["discount"] < 1.0:
+        basis_parts.append(f"widened +/-1 bed, discounted "
+                           f"{round((1 - base_track['discount']) * 100)}%")
+    if upside_track:
+        basis_parts.append(
+            f"upside ${arv_upside:,.0f} from {upside_track['n']} higher-bed comp(s), "
+            + ("CREDITED (walkthrough verified)" if upside_credited
+               else "NOT credited — walkthrough has not verified the layout converts"))
+    if band_flag:
+        basis_parts.append(band_flag)
+    basis = " | ".join(basis_parts)
+
+    if upside_track and not upside_credited:
+        logger.info("Upside ARV $%s available but not credited — no verified walkthrough",
+                    f"{arv_upside:,.0f}")
+
     return ARVResult(
         arv_low=round(arv_low),
         arv_mid=round(arv_mid),
@@ -546,6 +768,15 @@ def calculate_arv(subject: SubjectProperty, comps: list[CompProperty]) -> ARVRes
         bucket_b_count=len(bucket_b),
         avg_adjustment=round(avg_adj),
         spread_pct=round(spread_pct, 1),
+        arv_base=round(arv_base),
+        arv_upside=round(arv_upside),
+        upside_credited=upside_credited,
+        same_bed_count=same_bed_n,
+        upside_comp_count=upside_track["n"] if upside_track else 0,
+        band_median=round(band_median),
+        band_clamped=band_clamped,
+        band_flag=band_flag,
+        basis=basis,
     )
 
 

@@ -555,7 +555,9 @@ async def run_nj_scrape(
         for info in csv_infos:
             logger.info("DataSift CSV (%s): %s", info["label"], info["path"])
         upload_result = await upload_to_datasift(
+            # Explicit target list — upload_csv no longer derives one.
             csv_infos[0]["path"], enrich=True, skip_trace=True,
+            list_name="SiftStack",
         )
         result["upload"] = upload_result
         if upload_result.get("success"):

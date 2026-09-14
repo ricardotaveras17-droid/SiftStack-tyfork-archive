@@ -16,23 +16,172 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 import config
-import sku_pricing
 
 logger = logging.getLogger(__name__)
 
-# ── Regional multipliers ──────────────────────────────────────────────
-# Knoxville labor/materials costs relative to national average (1.0)
-REGIONAL_MULTIPLIERS = {
-    "knoxville": 0.88,      # ~12% below national average
-    "blount": 0.86,          # Slightly lower than Knox
-    "national": 1.00,
-    "nashville": 0.95,
-    "chattanooga": 0.90,
+# ── Regional cost calibration ─────────────────────────────────────────
+# Labor and materials diverge. Materials are close to a national commodity
+# (a few percent either side of 1.00); labor tracks local wage scale and can
+# run 15-25% above national in a dense metro. One scalar cannot express that,
+# so every region carries both rates and they are applied to the matching
+# line items.
+#
+# There is NO silent fallback. An unrecognised or unresolvable region raises
+# UnknownRegionError. The previous behaviour quietly priced at national
+# average and printed it as though it were calibrated ("Region: Essex
+# (x1.00)"), which made a typo and a real market indistinguishable.
+
+
+class UnknownRegionError(ValueError):
+    """Raised when a cost region cannot be resolved, or is not calibrated."""
+
+
+@dataclass(frozen=True)
+class RegionRates:
+    """Cost multipliers against national average (1.00)."""
+    labor: float
+    materials: float
+    calibration: str      # provenance + confidence, surfaced in the report
+    verified: bool        # True only when backed by real local bids
+
+
+REGIONAL_RATES = {
+    # ── Tennessee — upstream calibration, behaviour preserved ─────────
+    # These were single blended scalars. Held as labor == materials so TN
+    # estimates stay numerically identical to the pre-split engine. No TN
+    # number was invented, split, or changed.
+    "knoxville":   RegionRates(0.88, 0.88, "TN upstream blended scalar, unchanged", True),
+    "blount":      RegionRates(0.86, 0.86, "TN upstream blended scalar, unchanged", True),
+    "nashville":   RegionRates(0.95, 0.95, "TN upstream blended scalar, unchanged", True),
+    "chattanooga": RegionRates(0.90, 0.90, "TN upstream blended scalar, unchanged", True),
+    "national":    RegionRates(1.00, 1.00, "national average baseline", True),
+
+    # ── New Jersey — UNVERIFIED ───────────────────────────────────────
+    # Derived from RSMeans-style city cost index territory (North Jersey
+    # indexes ~105-113 against a 100 national base), NOT from local bids.
+    # Blended effect at a 50/50 labor/materials mix:
+    #   Essex 1.12 | Union 1.10 | Middlesex 1.08 | Somerset 1.06
+    # TODO(calibration): replace with rates derived from 2-3 real GC bids per
+    # county on completed rehabs, then flip verified=True. Until then every
+    # estimate carries an UNVERIFIED banner.
+    "essex":     RegionRates(1.21, 1.03, "NJ index-derived (RSMeans-style city cost index); needs GC-bid validation", False),
+    "union":     RegionRates(1.18, 1.03, "NJ index-derived (RSMeans-style city cost index); needs GC-bid validation", False),
+    "middlesex": RegionRates(1.14, 1.02, "NJ index-derived (RSMeans-style city cost index); needs GC-bid validation", False),
+    "somerset":  RegionRates(1.11, 1.01, "NJ index-derived (RSMeans-style city cost index); needs GC-bid validation", False),
 }
-DEFAULT_REGION = "knoxville"
+
+# Empty means "resolve from the property". Kept as a name because callers
+# import it; it is no longer a market.
+DEFAULT_REGION = ""
+
+# (state, county) -> region. Explicit only. Nothing is inferred from a ZIP:
+# a wrong ZIP-to-county guess would reintroduce exactly the silent mispricing
+# this module now refuses to perform.
+_COUNTY_REGION = {
+    ("NJ", "essex"): "essex",
+    ("NJ", "union"): "union",
+    ("NJ", "middlesex"): "middlesex",
+    ("NJ", "somerset"): "somerset",
+    ("TN", "knox"): "knoxville",
+    ("TN", "blount"): "blount",
+    ("TN", "davidson"): "nashville",
+    ("TN", "hamilton"): "chattanooga",
+}
+
+# (state, municipality) -> region, for the towns actually worked. Deliberately
+# small: every entry is a municipality wholly inside one county. Names that are
+# ambiguous across NJ counties (Franklin Twp, Raritan, Springfield, Washington)
+# are intentionally absent -- an unlisted city asks for the county instead.
+_CITY_REGION = {
+    ("NJ", "newark"): "essex",
+    ("NJ", "irvington"): "essex",
+    ("NJ", "east orange"): "essex",
+    ("NJ", "orange"): "essex",
+    ("NJ", "west orange"): "essex",
+    ("NJ", "bloomfield"): "essex",
+    ("NJ", "montclair"): "essex",
+    ("NJ", "belleville"): "essex",
+    ("NJ", "nutley"): "essex",
+    ("NJ", "maplewood"): "essex",
+    ("NJ", "south orange"): "essex",
+    ("NJ", "livingston"): "essex",
+    ("NJ", "elizabeth"): "union",
+    ("NJ", "plainfield"): "union",
+    ("NJ", "linden"): "union",
+    ("NJ", "rahway"): "union",
+    ("NJ", "union"): "union",
+    ("NJ", "westfield"): "union",
+    ("NJ", "cranford"): "union",
+    ("NJ", "roselle"): "union",
+    ("NJ", "hillside"): "union",
+    ("NJ", "summit"): "union",
+    ("NJ", "new brunswick"): "middlesex",
+    ("NJ", "perth amboy"): "middlesex",
+    ("NJ", "edison"): "middlesex",
+    ("NJ", "woodbridge"): "middlesex",
+    ("NJ", "piscataway"): "middlesex",
+    ("NJ", "old bridge"): "middlesex",
+    ("NJ", "carteret"): "middlesex",
+    ("NJ", "sayreville"): "middlesex",
+    ("NJ", "somerville"): "somerset",
+    ("NJ", "bridgewater"): "somerset",
+    ("NJ", "bound brook"): "somerset",
+    ("NJ", "hillsborough"): "somerset",
+    ("NJ", "manville"): "somerset",
+    ("TN", "knoxville"): "knoxville",
+    ("TN", "maryville"): "blount",
+    ("TN", "alcoa"): "blount",
+    ("TN", "nashville"): "nashville",
+    ("TN", "chattanooga"): "chattanooga",
+}
+
+
+def _known_regions() -> str:
+    return ", ".join(sorted(REGIONAL_RATES))
+
+
+def region_rates(region: str) -> RegionRates:
+    """Look up a region's rates. Raises rather than defaulting to national."""
+    key = (region or "").strip().lower()
+    try:
+        return REGIONAL_RATES[key]
+    except KeyError:
+        raise UnknownRegionError(
+            f"Region {region!r} is not calibrated. Known regions: {_known_regions()}."
+        ) from None
+
+
+def resolve_region(region: str = "", state: str = "", county: str = "",
+                   city: str = "") -> str:
+    """Resolve a calibrated region key from whatever the caller knows.
+
+    Precedence: explicit region > (state, county) > (state, city).
+    Raises UnknownRegionError instead of guessing or defaulting.
+    """
+    if region:
+        region_rates(region)          # validates, raises if unknown
+        return region.strip().lower()
+
+    st = (state or "").strip().upper()
+    if county:
+        c = county.strip().lower().removesuffix(" county").strip()
+        hit = _COUNTY_REGION.get((st, c))
+        if hit:
+            return hit
+    if city:
+        hit = _CITY_REGION.get((st, city.strip().lower()))
+        if hit:
+            return hit
+
+    raise UnknownRegionError(
+        f"Could not resolve a cost region from state={state!r} county={county!r} "
+        f"city={city!r}. Pass an explicit --region, or a --county. "
+        f"Known regions: {_known_regions()}. Refusing to fall back to national "
+        "average: that is how an uncalibrated market gets silently mispriced."
+    )
 
 # ── 4-Tier Finish System ─────────────────────────────────────────────
-# Cost per sqft by tier (national average, before regional multiplier)
+# Cost per sqft by tier (national average, before regional multipliers)
 TIER_NAMES = {
     1: "Minimum Viable",     # Cheapest materials, basic function
     2: "Builder Grade",      # Standard new construction level
@@ -42,7 +191,7 @@ TIER_NAMES = {
 
 # ── Room cost tables ──────────────────────────────────────────────────
 # Each room category has cost ranges per tier: {tier: (materials, labor)}
-# All costs in USD, national average, before regional multiplier
+# All costs in USD, national average, before regional multipliers
 
 KITCHEN_COSTS = {
     1: {"demo": 500, "cabinets": 2500, "countertops": 800, "appliances": 1500,
@@ -113,6 +262,43 @@ TIMELINE_WEEKS = {
     "exterior": {1: 1, 2: 2, 3: 3, 4: 4},
 }
 
+# ── Wholetail scope model ─────────────────────────────────────────────
+# A wholetail is NOT a light version of a gut. It is a different job:
+# you make the house work and show well, and you do not replace the kitchen.
+#
+# The previous model had it backwards in both directions. It charged a full
+# kitchen and full bathroom replacement (together over half the estimate) while
+# EXCLUDING HVAC, plumbing and electrical as "full scope only" -- on a real NJ
+# wholetail, HVAC was the single largest line and there was no kitchen spend at
+# all. The two errors partly cancelled, which is why the total looked merely
+# high instead of obviously wrong.
+#
+# Each factor is the share of the full-scope cost that a wholetail actually
+# incurs for that category. Systems are "make it work", not "replace".
+#
+# CALIBRATION STATUS: the SHAPE here is structural and defensible on its own --
+# a wholetail refreshes rather than replaces, and it cannot skip a dead
+# furnace. The MAGNITUDES are informed by a single closed NJ job
+# (119 East Rd, Belford: $50,035 on 1,652 sqft) and should be re-checked once
+# two more wholetails have closed. See src/nj_cost_calibration.py.
+# DIRECTION OF ERROR IS DELIBERATE. Rehab is subtracted from MAO, so an
+# understated scope overstates what we are authorised to pay, dollar for
+# dollar. Where these factors are uncertain they sit on the high side: an
+# estimate that is 10% heavy costs a deal, one that is 10% light costs money.
+WHOLETAIL_FACTORS = {
+    "kitchen": 0.35,        # paint/reface cabinets, hardware, counters — not a rip-out
+    "bath": 0.40,           # vanity, fixtures, re-caulk, spot tile
+    "flooring": 0.50,       # replace the worst, refinish the rest
+    "paint": 1.00,          # you always paint
+    "exterior": 0.60,       # cleanup, trim, landscaping, drive patch
+    "hvac": 0.85,           # the unit is dead more often than not; no new ductwork
+    "plumbing": 0.55,       # fix what leaks and what fails inspection
+    "electrical": 0.45,     # make it safe and legal, no rewire
+}
+# Cleanout, staging and the make-ready odds and ends a gut absorbs into its
+# larger line items but a wholetail pays for visibly.
+WHOLETAIL_MAKEREADY_PER_SQFT = 3.75
+
 # ── Data structures ───────────────────────────────────────────────────
 
 
@@ -127,7 +313,6 @@ class RoomEstimate:
     line_items: dict = field(default_factory=dict)
     weeks: float = 0.0
     notes: str = ""
-    materials_source: str = "engine"  # "engine" or "locked_sku"
 
 
 @dataclass
@@ -136,8 +321,12 @@ class RehabEstimate:
     address: str = ""
     tier: int = 2
     scope: str = "full"  # "full" or "wholetail"
-    region: str = DEFAULT_REGION
-    regional_multiplier: float = 0.88
+    region: str = ""
+    regional_multiplier: float = 1.0        # effective blended rate, computed
+    labor_multiplier: float = 1.0
+    materials_multiplier: float = 1.0
+    region_calibration: str = ""
+    region_verified: bool = True
     sqft: int = 0
     bedrooms: int = 0
     bathrooms: float = 0.0
@@ -151,17 +340,17 @@ class RehabEstimate:
     contingency_pct: float = 0.10  # 10% contingency
     contingency_cost: float = 0.0
     grand_total: float = 0.0
-    materials_source: str = "engine"  # "engine" or the locked-list stamp
 
 
 # ── Estimation engine ─────────────────────────────────────────────────
 
-def _calc_room(category: str, cost_table: dict, tier: int, multiplier: float,
-               quantity: int = 1) -> RoomEstimate:
-    """Calculate cost for a room category from its cost table."""
+def _calc_room(category: str, cost_table: dict, tier: int, rates: RegionRates,
+               quantity: int = 1, factor: float = 1.0) -> RoomEstimate:
+    """Cost for a room category. ``factor`` scales it for a lighter scope."""
     tier_costs = cost_table.get(tier, cost_table.get(2, {}))
-    labor = tier_costs.get("labor", 0) * multiplier * quantity
-    materials = sum(v for k, v in tier_costs.items() if k != "labor") * multiplier * quantity
+    labor = tier_costs.get("labor", 0) * rates.labor * quantity * factor
+    materials = (sum(v for k, v in tier_costs.items() if k != "labor")
+                 * rates.materials * quantity * factor)
 
     return RoomEstimate(
         category=category,
@@ -169,18 +358,21 @@ def _calc_room(category: str, cost_table: dict, tier: int, multiplier: float,
         materials=round(materials),
         labor=round(labor),
         total=round(materials + labor),
-        line_items={k: round(v * multiplier * quantity) for k, v in tier_costs.items()},
+        line_items={k: round(v * (rates.labor if k == "labor" else rates.materials)
+                             * quantity * factor)
+                    for k, v in tier_costs.items()},
         weeks=TIMELINE_WEEKS.get(category.lower().split()[0], {}).get(tier, 1) * quantity,
     )
 
 
 def _calc_per_sqft(category: str, sqft: int, mat_table: dict, labor_table: dict,
-                   tier: int, multiplier: float, timeline_key: str = "") -> RoomEstimate:
-    """Calculate cost for a per-sqft category."""
+                   tier: int, rates: RegionRates, timeline_key: str = "",
+                   factor: float = 1.0) -> RoomEstimate:
+    """Cost for a per-sqft category. ``factor`` scales it for a lighter scope."""
     mat_rate = mat_table.get(tier, mat_table.get(2, 0))
     labor_rate = labor_table.get(tier, labor_table.get(2, 0))
-    materials = round(sqft * mat_rate * multiplier)
-    labor = round(sqft * labor_rate * multiplier)
+    materials = round(sqft * mat_rate * rates.materials * factor)
+    labor = round(sqft * labor_rate * rates.labor * factor)
 
     return RoomEstimate(
         category=category,
@@ -188,18 +380,22 @@ def _calc_per_sqft(category: str, sqft: int, mat_table: dict, labor_table: dict,
         materials=materials,
         labor=labor,
         total=materials + labor,
-        line_items={"materials_per_sqft": round(mat_rate * multiplier, 2),
-                    "labor_per_sqft": round(labor_rate * multiplier, 2),
+        line_items={"materials_per_sqft": round(mat_rate * rates.materials, 2),
+                    "labor_per_sqft": round(labor_rate * rates.labor, 2),
                     "sqft": sqft},
         weeks=TIMELINE_WEEKS.get(timeline_key or category.lower(), {}).get(tier, 1),
     )
 
 
-def _calc_fixed(category: str, cost_table: dict, tier: int, multiplier: float,
-                timeline_key: str = "") -> RoomEstimate:
+def _calc_fixed(category: str, cost_table: dict, tier: int, rates: RegionRates,
+                timeline_key: str = "", factor: float = 1.0) -> RoomEstimate:
     """Calculate cost for a fixed-cost category (HVAC, electrical, etc.)."""
-    total = round(cost_table.get(tier, cost_table.get(2, 0)) * multiplier)
-    # Rough 60/40 labor/materials split for mechanical work
+    # Rough 60/40 labor/materials split for mechanical work. The split is
+    # applied to the BASE cost so each half takes its own multiplier, then the
+    # original round-then-split shape is preserved -- which reproduces the old
+    # numbers exactly whenever labor == materials (every TN region).
+    base = cost_table.get(tier, cost_table.get(2, 0)) * factor
+    total = round(base * 0.6 * rates.labor + base * 0.4 * rates.materials)
     labor = round(total * 0.6)
     materials = total - labor
 
@@ -214,39 +410,11 @@ def _calc_fixed(category: str, cost_table: dict, tier: int, multiplier: float,
     )
 
 
-def _sku_component_room(category: str, cost_table: dict, tier: int, multiplier: float,
-                        groups: dict, quantity: int = 1,
-                        timeline_key: str = "") -> RoomEstimate:
-    """SKU-grounded variant of _calc_room: materials from the locked Knox
-    basket (already local pricing, so NO regional multiplier on materials);
-    demo and labor from the engine table. Demo is a service, so in SKU mode it
-    moves to the labor side instead of masquerading as a material."""
-    tier_costs = cost_table.get(tier, cost_table.get(2, {}))
-    demo = round(tier_costs.get("demo", 0) * multiplier * quantity)
-    engine_paint = round(tier_costs.get("paint", 0) * multiplier * quantity)
-    engine_labor = round(tier_costs.get("labor", 0) * multiplier * quantity)
-    sku = {k: round(v * quantity) for k, v in groups.items()}
-    materials = sum(sku.values()) + engine_paint
-    labor = engine_labor + demo
-
-    return RoomEstimate(
-        category=category,
-        tier=tier,
-        materials=materials,
-        labor=labor,
-        total=materials + labor,
-        line_items={"demo": demo, **sku, "paint": engine_paint, "labor": engine_labor},
-        weeks=TIMELINE_WEEKS.get(timeline_key or category.lower().split()[0],
-                                 {}).get(tier, 1) * quantity,
-        materials_source="locked_sku",
-    )
-
-
 def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
                    bathrooms: float = 2.0, year_built: int = 0,
                    tier: int = 2, scope: str = "full",
-                   region: str = DEFAULT_REGION,
-                   use_locked_materials: bool = True) -> RehabEstimate:
+                   region: str = "", state: str = "", county: str = "",
+                   city: str = "") -> RehabEstimate:
     """Generate a full rehab estimate for a property.
 
     Args:
@@ -257,199 +425,127 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
         year_built: Year built (affects which systems need replacement)
         tier: Finish tier 1-4
         scope: "full" (everything) or "wholetail" (cosmetic only)
-        region: Regional pricing key
+        region: Explicit region key; overrides state/county/city resolution
+        state: Two-letter state, used to resolve the region
+        county: County name, used to resolve the region
+        city: Municipality, used to resolve the region when no county is known
+
+    Raises:
+        UnknownRegionError: the region cannot be resolved or is not calibrated
+        ValueError: sqft was not supplied
     """
-    multiplier = REGIONAL_MULTIPLIERS.get(region.lower(), REGIONAL_MULTIPLIERS["national"])
+    region = resolve_region(region=region, state=state, county=county, city=city)
+    rates = region_rates(region)
+    if not rates.verified:
+        logger.warning(
+            "Region %r is NOT bid-calibrated (%s). Treat this estimate as "
+            "indicative until real local bids replace the index figures.",
+            region, rates.calibration)
     tier = max(1, min(4, tier))
 
-    # Default sqft if not provided
     if not sqft:
-        sqft = 1500  # Knoxville average for older SFH
+        raise ValueError(
+            "sqft is required. This engine used to fall back to a 1,500 sqft "
+            "Knoxville median, which silently sized every estimate off another "
+            "market's typical house. Pass --sqft, or a subject with living area."
+        )
 
     full_baths = int(bathrooms)
     secondary_baths = max(0, full_baths - 1)
     # Window estimate: ~1 per 100 sqft
     window_count = max(8, sqft // 100)
-    roof_sqft = int(sqft * 1.1)
 
-    # ── Locked SKU materials (Knox markets, tiers 1-3 only) ───────
-    # Materials come from the locked master material list (real Home Depot
-    # SKUs local to zip 37914); labor stays on the engine tables with the
-    # regional multiplier. Tier 4 is off-list by definition. A missing file
-    # or missing SKU falls back to the legacy tables, loudly.
-    locked = None
-    if use_locked_materials and tier <= 3 and region.lower() in sku_pricing.SKU_REGIONS:
-        locked = sku_pricing.load_locked()
-    ctx = {"sqft": sqft, "beds": bedrooms, "full_baths": full_baths,
-           "secondary_baths": secondary_baths, "window_count": window_count,
-           "roof_sqft": roof_sqft}
-
-    def _sku(cat_key: str):
-        return sku_pricing.category_materials(cat_key, ctx, tier, locked) if locked else None
+    # A wholetail refreshes what a gut replaces. Factors are 1.0 on a full
+    # rehab, so the full-scope numbers are untouched by this.
+    wt = scope == "wholetail"
+    def f(key: str) -> float:
+        return WHOLETAIL_FACTORS[key] if wt else 1.0
 
     rooms = []
 
     # ── Always included (both wholetail and full) ─────────────────
     # Kitchen
-    groups = _sku("kitchen")
-    if groups is not None:
-        rooms.append(_sku_component_room("Kitchen", KITCHEN_COSTS, tier, multiplier,
-                                         groups, timeline_key="kitchen"))
-    else:
-        rooms.append(_calc_room("Kitchen", KITCHEN_COSTS, tier, multiplier))
+    rooms.append(_calc_room("Kitchen", KITCHEN_COSTS, tier, rates, factor=f("kitchen")))
 
     # Master bath
-    groups = _sku("master_bath")
-    if groups is not None:
-        rooms.append(_sku_component_room("Master Bathroom", MASTER_BATH_COSTS, tier,
-                                         multiplier, groups, timeline_key="bathrooms"))
-    else:
-        rooms.append(_calc_room("Master Bathroom", MASTER_BATH_COSTS, tier, multiplier))
+    rooms.append(_calc_room("Master Bathroom", MASTER_BATH_COSTS, tier, rates,
+                            factor=f("bath")))
 
     # Secondary baths
     if secondary_baths > 0:
-        groups = _sku("secondary_bath")
-        if groups is not None:
-            rooms.append(_sku_component_room("Secondary Bathroom(s)", SECONDARY_BATH_COSTS,
-                                             tier, multiplier, groups,
-                                             quantity=secondary_baths,
-                                             timeline_key="bathrooms"))
-        else:
-            rooms.append(_calc_room("Secondary Bathroom(s)", SECONDARY_BATH_COSTS,
-                                    tier, multiplier, quantity=secondary_baths))
+        rooms.append(_calc_room("Secondary Bathroom(s)", SECONDARY_BATH_COSTS,
+                                tier, rates, quantity=secondary_baths, factor=f("bath")))
 
     # Flooring (whole house)
-    groups = _sku("flooring")
-    if groups is not None:
-        mat = round(groups["lvp"])
-        labor_rate = FLOORING_LABOR_PER_SQFT.get(tier, FLOORING_LABOR_PER_SQFT[2])
-        labor = round(sqft * labor_rate * multiplier)
-        rooms.append(RoomEstimate(
-            category="Flooring", tier=tier, materials=mat, labor=labor,
-            total=mat + labor,
-            line_items={"materials_per_sqft": round(mat / sqft, 2) if sqft else 0,
-                        "labor_per_sqft": round(labor_rate * multiplier, 2),
-                        "sqft": sqft},
-            weeks=TIMELINE_WEEKS["flooring"].get(tier, 1),
-            materials_source="locked_sku"))
-    else:
-        rooms.append(_calc_per_sqft("Flooring", sqft, FLOORING_PER_SQFT,
-                                    FLOORING_LABOR_PER_SQFT, tier, multiplier, "flooring"))
+    rooms.append(_calc_per_sqft("Flooring", sqft, FLOORING_PER_SQFT,
+                                FLOORING_LABOR_PER_SQFT, tier, rates, "flooring",
+                                factor=f("flooring")))
 
     # Paint (whole house)
-    groups = _sku("paint_interior")
-    if groups is not None:
-        mat = round(groups["paint"])
-        labor_rate = PAINT_LABOR_PER_SQFT.get(tier, PAINT_LABOR_PER_SQFT[2])
-        labor = round(sqft * labor_rate * multiplier)
-        rooms.append(RoomEstimate(
-            category="Paint (Interior)", tier=tier, materials=mat, labor=labor,
-            total=mat + labor,
-            line_items={"materials_per_sqft": round(mat / sqft, 2) if sqft else 0,
-                        "labor_per_sqft": round(labor_rate * multiplier, 2),
-                        "sqft": sqft},
-            weeks=TIMELINE_WEEKS["paint"].get(tier, 1),
-            materials_source="locked_sku"))
-    else:
-        rooms.append(_calc_per_sqft("Paint (Interior)", sqft, PAINT_PER_SQFT,
-                                    PAINT_LABOR_PER_SQFT, tier, multiplier, "paint"))
+    rooms.append(_calc_per_sqft("Paint (Interior)", sqft, PAINT_PER_SQFT,
+                                PAINT_LABOR_PER_SQFT, tier, rates, "paint",
+                                factor=f("paint")))
 
     # Exterior
-    groups = _sku("exterior")
-    if groups is not None:
-        # Siding and driveway have no HD-SKU basket; those components stay on
-        # the engine line (with the multiplier). Paint + landscaping are SKU.
-        tier_costs = EXTERIOR_COSTS.get(tier, EXTERIOR_COSTS[2])
-        siding = round(tier_costs.get("siding", 0) * multiplier)
-        driveway = round(tier_costs.get("driveway", 0) * multiplier)
-        ext_labor = round(tier_costs.get("labor", 0) * multiplier)
-        paint = round(groups["paint"])
-        landscaping = round(groups["landscaping"])
-        ext_mat = siding + paint + landscaping + driveway
+    rooms.append(_calc_room("Exterior", EXTERIOR_COSTS, tier, rates, factor=f("exterior")))
+
+    # ── Systems: BOTH scopes ──────────────────────────────────────
+    # A wholetail cannot skip a dead furnace. These used to be full-scope only,
+    # which is why a real wholetail whose largest line was HVAC came out of the
+    # engine with no HVAC in it at all.
+    rooms.append(_calc_fixed("HVAC", HVAC_COSTS, tier, rates, "hvac", factor=f("hvac")))
+    rooms.append(_calc_fixed("Electrical", ELECTRICAL_COSTS, tier, rates, "electrical",
+                             factor=f("electrical")))
+    rooms.append(_calc_fixed("Plumbing", PLUMBING_COSTS, tier, rates, "plumbing",
+                             factor=f("plumbing")))
+
+    if wt:
+        # Cleanout, staging and make-ready. A gut absorbs these into bigger
+        # line items; a wholetail pays for them visibly.
+        mr = round(sqft * WHOLETAIL_MAKEREADY_PER_SQFT * rates.labor)
         rooms.append(RoomEstimate(
-            category="Exterior", tier=tier, materials=ext_mat, labor=ext_labor,
-            total=ext_mat + ext_labor,
-            line_items={"siding": siding, "paint": paint, "landscaping": landscaping,
-                        "driveway": driveway, "labor": ext_labor},
-            weeks=TIMELINE_WEEKS["exterior"].get(tier, 1),
-            materials_source="locked_sku"))
-    else:
-        rooms.append(_calc_room("Exterior", EXTERIOR_COSTS, tier, multiplier))
+            category="Cleanout / Make-Ready", tier=tier,
+            materials=round(mr * 0.2), labor=round(mr * 0.8), total=mr,
+            line_items={"per_sqft": round(WHOLETAIL_MAKEREADY_PER_SQFT * rates.labor, 2),
+                        "sqft": sqft},
+            weeks=1.0))
 
     # ── Full rehab only ───────────────────────────────────────────
     if scope == "full":
         # Windows
-        groups = _sku("windows")
-        if groups is not None:
-            mat = round(groups["windows"])
-            # Engine's implied labor share (40% of the installed unit price)
-            labor = round(WINDOWS_PER_UNIT.get(tier, 400) * window_count * multiplier * 0.4)
-            rooms.append(RoomEstimate(
-                category="Windows", tier=tier, materials=mat, labor=labor,
-                total=mat + labor,
-                line_items={"per_window": round((mat + labor) / window_count),
-                            "count": window_count},
-                weeks=TIMELINE_WEEKS["windows"].get(tier, 1),
-                materials_source="locked_sku"))
-        else:
-            window_total = round(WINDOWS_PER_UNIT.get(tier, 400) * window_count * multiplier)
-            rooms.append(RoomEstimate(
-                category="Windows", tier=tier,
-                materials=round(window_total * 0.6), labor=round(window_total * 0.4),
-                total=window_total,
-                line_items={"per_window": round(WINDOWS_PER_UNIT.get(tier, 400) * multiplier),
-                            "count": window_count},
-                weeks=TIMELINE_WEEKS["windows"].get(tier, 1),
-            ))
+        # 60/40 materials/labor. Each half takes its own multiplier, then the
+        # original round-then-split shape is preserved, so a region whose two
+        # rates match reproduces the previous number exactly.
+        window_unit = WINDOWS_PER_UNIT.get(tier, 400)
+        window_blend = 0.6 * rates.materials + 0.4 * rates.labor
+        window_total = round(window_unit * window_count * window_blend)
+        rooms.append(RoomEstimate(
+            category="Windows", tier=tier,
+            materials=round(window_total * 0.6), labor=round(window_total * 0.4),
+            total=window_total,
+            line_items={"per_window": round(window_unit * window_blend),
+                        "count": window_count},
+            weeks=TIMELINE_WEEKS["windows"].get(tier, 1),
+        ))
 
         # Roof (sqft × 1.1 for slope)
-        groups = _sku("roof")
-        if groups is not None:
-            mat = round(groups["roof"])
-            # Engine's implied labor share (50% of the per-sqft installed rate)
-            labor = round(ROOF_PER_SQFT.get(tier, 5) * roof_sqft * multiplier * 0.5)
-            rooms.append(RoomEstimate(
-                category="Roof", tier=tier, materials=mat, labor=labor,
-                total=mat + labor,
-                line_items={"per_sqft": round((mat + labor) / roof_sqft, 2) if roof_sqft else 0,
-                            "roof_sqft": roof_sqft},
-                weeks=TIMELINE_WEEKS["roof"].get(tier, 1),
-                materials_source="locked_sku"))
-        else:
-            roof_total = round(ROOF_PER_SQFT.get(tier, 5) * roof_sqft * multiplier)
-            rooms.append(RoomEstimate(
-                category="Roof", tier=tier,
-                materials=round(roof_total * 0.5), labor=round(roof_total * 0.5),
-                total=roof_total,
-                line_items={"per_sqft": round(ROOF_PER_SQFT.get(tier, 5) * multiplier, 2),
-                            "roof_sqft": roof_sqft},
-                weeks=TIMELINE_WEEKS["roof"].get(tier, 1),
-            ))
+        roof_sqft = int(sqft * 1.1)
+        roof_rate = ROOF_PER_SQFT.get(tier, 5)
+        roof_blend = 0.5 * rates.materials + 0.5 * rates.labor
+        roof_total = round(roof_rate * roof_sqft * roof_blend)
+        rooms.append(RoomEstimate(
+            category="Roof", tier=tier,
+            materials=round(roof_total * 0.5), labor=round(roof_total * 0.5),
+            total=roof_total,
+            line_items={"per_sqft": round(roof_rate * roof_blend, 2),
+                        "roof_sqft": roof_sqft},
+            weeks=TIMELINE_WEEKS["roof"].get(tier, 1),
+        ))
 
-        # HVAC / Electrical / Plumbing: SKU materials + engine labor share
-        # (60% of the installed table price, the engine's own split).
-        for cat_name, cat_key, cost_table, tkey in (
-                ("HVAC", "hvac", HVAC_COSTS, "hvac"),
-                ("Electrical", "electrical", ELECTRICAL_COSTS, "electrical"),
-                ("Plumbing", "plumbing", PLUMBING_COSTS, "plumbing")):
-            groups = _sku(cat_key)
-            if groups is not None:
-                mat = round(sum(groups.values()))
-                labor = round(cost_table.get(tier, cost_table.get(2, 0)) * multiplier * 0.6)
-                rooms.append(RoomEstimate(
-                    category=cat_name, tier=tier, materials=mat, labor=labor,
-                    total=mat + labor,
-                    line_items={"total_installed": mat + labor},
-                    weeks=TIMELINE_WEEKS[tkey].get(tier, 1),
-                    materials_source="locked_sku"))
-            else:
-                rooms.append(_calc_fixed(cat_name, cost_table, tier, multiplier, tkey))
-
-        # Foundation/Structural (only for older homes; no SKU basket, structural
-        # scope is quote territory)
+        # Foundation/Structural (only for older homes)
         if year_built and year_built < 1970:
             rooms.append(_calc_fixed("Foundation/Structural", FOUNDATION_COSTS,
-                                     tier, multiplier, "foundation"))
+                                     tier, rates, "foundation"))
 
     # ── Totals ────────────────────────────────────────────────────
     total_materials = sum(r.materials for r in rooms)
@@ -462,16 +558,24 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
     contingency = round(total_cost * 0.10)  # 10% contingency
     grand_total = total_cost + permits + contingency
 
-    materials_source = "engine"
-    if locked and any(r.materials_source == "locked_sku" for r in rooms):
-        materials_source = locked["_stamp"]
+    # Effective blended multiplier, back-derived from what was actually spent on
+    # each half. Reported instead of a fixed scalar because the blend depends on
+    # this job's labor/material mix, not on the region alone.
+    base_materials = total_materials / rates.materials if rates.materials else 0.0
+    base_labor = total_labor / rates.labor if rates.labor else 0.0
+    base_total = base_materials + base_labor
+    effective_multiplier = (total_cost / base_total) if base_total else 1.0
 
     estimate = RehabEstimate(
         address=address,
         tier=tier,
         scope=scope,
         region=region,
-        regional_multiplier=multiplier,
+        regional_multiplier=round(effective_multiplier, 4),
+        labor_multiplier=rates.labor,
+        materials_multiplier=rates.materials,
+        region_calibration=rates.calibration,
+        region_verified=rates.verified,
         sqft=sqft,
         bedrooms=bedrooms,
         bathrooms=bathrooms,
@@ -484,7 +588,6 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
         permits_cost=permits,
         contingency_cost=contingency,
         grand_total=round(grand_total),
-        materials_source=materials_source,
     )
 
     logger.info("Rehab estimate for %s: %s scope, Tier %d (%s), Total $%s, ~%.0f weeks",
@@ -496,10 +599,12 @@ def estimate_rehab(address: str = "", sqft: int = 0, bedrooms: int = 3,
 
 def estimate_wholetail(address: str = "", sqft: int = 0, bedrooms: int = 3,
                        bathrooms: float = 2.0, year_built: int = 0,
-                       tier: int = 2, region: str = DEFAULT_REGION) -> RehabEstimate:
+                       tier: int = 2, region: str = "", state: str = "",
+                       county: str = "", city: str = "") -> RehabEstimate:
     """Generate a wholetail (cosmetic-only) estimate."""
     return estimate_rehab(address, sqft, bedrooms, bathrooms, year_built,
-                          tier=min(tier, 2), scope="wholetail", region=region)
+                          tier=min(tier, 2), scope="wholetail", region=region,
+                          state=state, county=county, city=city)
 
 
 # ── Excel report generation ──────────────────────────────────────────
@@ -553,7 +658,12 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
     row = 5
     data = [
         ("Finish Tier", f"Tier {full_est.tier} — {TIER_NAMES[full_est.tier]}"),
-        ("Region", f"{full_est.region.title()} (×{full_est.regional_multiplier:.2f})"),
+        ("Region", f"{full_est.region.title()} — labor ×{full_est.labor_multiplier:.2f}, "
+                    f"materials ×{full_est.materials_multiplier:.2f} "
+                    f"(effective ×{full_est.regional_multiplier:.2f})"),
+        ("Cost calibration",
+         ("BID-CALIBRATED — " if full_est.region_verified else "⚠ UNVERIFIED — ")
+         + full_est.region_calibration),
         ("Property Size", f"{full_est.sqft:,} sqft"),
         ("Bed/Bath", f"{full_est.bedrooms}bd / {full_est.bathrooms}ba"),
         ("Year Built", str(full_est.year_built) if full_est.year_built else "N/A"),
@@ -749,10 +859,13 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
     ws9.cell(row=1, column=1, value="Notes & Assumptions").font = _TITLE_FONT
     notes = [
         f"Tier {full_est.tier}: {TIER_NAMES[full_est.tier]}",
-        f"Regional multiplier: {full_est.region.title()} = {full_est.regional_multiplier:.2f}x national avg",
-        f"Materials source: {full_est.materials_source}"
-        + (" (locked Knox SKU prices; multiplier applies to labor only)"
-           if full_est.materials_source != "engine" else " (blended engine tables)"),
+        f"Regional calibration: {full_est.region.title()} — labor "
+        f"{full_est.labor_multiplier:.2f}x / materials {full_est.materials_multiplier:.2f}x "
+        f"national avg (effective {full_est.regional_multiplier:.2f}x)",
+        ("Cost basis is BID-CALIBRATED for this market."
+         if full_est.region_verified
+         else "WARNING: cost basis for this market is UNVERIFIED — "
+              f"{full_est.region_calibration}. Treat as indicative, not a budget."),
         "",
         "Tier Definitions:",
         "  Tier 1 (Minimum Viable): Cheapest materials, basic function. Rental-ready.",
@@ -796,7 +909,8 @@ def generate_rehab_report(full_est: RehabEstimate, wholetail_est: RehabEstimate 
 def run_rehab_estimate(address: str = "", sqft: int = 0, bedrooms: int = 3,
                        bathrooms: float = 2.0, year_built: int = 0,
                        tier: int = 2, scope: str = "full",
-                       region: str = DEFAULT_REGION,
+                       region: str = "", state: str = "", county: str = "",
+                       city: str = "",
                        output_path: str = "") -> dict:
     """Run rehab estimation and generate report.
 
@@ -807,11 +921,13 @@ def run_rehab_estimate(address: str = "", sqft: int = 0, bedrooms: int = 3,
 
     # Full rehab estimate
     full_est = estimate_rehab(address, sqft, bedrooms, bathrooms, year_built,
-                              tier=tier, scope="full", region=region)
+                              tier=tier, scope="full", region=region,
+                              state=state, county=county, city=city)
 
     # Wholetail comparison
     wholetail_est = estimate_wholetail(address, sqft, bedrooms, bathrooms,
-                                       year_built, region=region)
+                                       year_built, region=region, state=state,
+                                       county=county, city=city)
 
     # Generate report
     report_path = generate_rehab_report(full_est, wholetail_est, output_path)

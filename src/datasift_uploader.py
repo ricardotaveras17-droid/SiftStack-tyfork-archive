@@ -27,12 +27,71 @@ logger = logging.getLogger(__name__)
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
 
 
+class ListCategoryRequired(ValueError):
+    """Raised when an upload would put records in a list nobody explicitly named.
+
+    Mirrors SiftListCategoryRequired in the Sift Integration Engine's fence. The API
+    client refuses list writes outright; this is the same refusal on the browser path,
+    which the fence cannot reach.
+    """
+
+
+def _require_list_name(list_name: str | None, existing_list: bool) -> None:
+    """Refuse any upload that would name a DataSift list for us.
+
+    An auto-created list permanently pollutes the source-list structure and silently
+    changes what every filter preset selects. There is deliberately no default: the
+    safe-looking guess is the dangerous one, because it is invisible in the call.
+    """
+    if list_name and list_name.strip():
+        return
+    action = ("select an existing list"
+              if existing_list else "CREATE A NEW LIST in DataSift")
+    raise ListCategoryRequired(
+        f"an explicit list_name is required (got {list_name!r}) — this upload would "
+        f"{action}. Never invent, auto-name, default, or derive a list name for "
+        f"organizational convenience: an auto-created list permanently pollutes the "
+        f"source-list structure and silently changes what every filter preset selects. "
+        f"Pass the exact category named for this upload."
+    )
+
+
+async def _kill_wizard_overlays(page: Page) -> None:
+    """Remove overlays that swallow clicks on the wizard's Next button.
+
+    The NPS survey ("How likely are you to recommend REISift...") renders as a
+    fixed strip across the bottom and covers the Next button. It is a different
+    element from the Beamer push modal, and either one alone is enough to make
+    a click silently no-op. Best-effort and never raises.
+    """
+    try:
+        await page.evaluate("""() => {
+            for (const id of ['npsIframeContainer','beamerPushModal','beamerOverlay']) {
+                const el = document.getElementById(id);
+                if (el) el.remove();
+            }
+            document.querySelectorAll('[class*="beamer"],[id*="beamer"],iframe[src*="nps"]')
+                    .forEach(e => e.remove());
+            // NPS survey rendered inline rather than in an iframe.
+            document.querySelectorAll('div').forEach(d => {
+                if (d.children.length < 40 &&
+                    /How likely are you to recommend/i.test(d.textContent || '')) {
+                    const r = d.getBoundingClientRect();
+                    if (r.height > 0 && r.height < 400) d.remove();
+                }
+            });
+        }""")
+    except Exception:
+        pass
+
+
 async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     """Click the 'Next Step' button that appears in the upload wizard.
 
     Default timeout is 20s to handle slow SPA rendering in headless/cloud
     environments (Apify containers take longer than local desktop).
     """
+    await _kill_wizard_overlays(page)
     try:
         btn = page.locator(
             'button:has-text("Next Step"), '
@@ -46,6 +105,37 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     except PwTimeout:
         logger.warning("Next Step button not found within %dms", timeout)
         return False
+
+
+async def _advance_until(page: Page, probe, label: str, max_steps: int = 5) -> bool:
+    """Click Next until `probe()` reports the wanted control is on screen.
+
+    The wizard is navigated by CAPABILITY, not by step index. DataSift inserted
+    an "Enrichment" step at position 2 on 2026-08-20, which shifted every later
+    step by one; code that assumed a fixed step number looked for the file input
+    while still on "Add tags" and reported "Could not find file input element".
+    Probing for the control instead absorbs that insertion — and any future one.
+
+    Returns True if the control appeared (possibly without any click).
+    """
+    for attempt in range(max_steps + 1):
+        await _kill_wizard_overlays(page)
+        try:
+            if await probe():
+                if attempt:
+                    logger.info("Reached %s after %d Next click(s)", label, attempt)
+                return True
+        except Exception:
+            pass
+        if attempt == max_steps:
+            break
+        logger.debug("%s not present yet — advancing wizard (%d/%d)",
+                     label, attempt + 1, max_steps)
+        if not await _click_next_step(page):
+            break
+        await page.wait_for_timeout(2500)
+    logger.warning("%s never appeared after %d advance attempt(s)", label, max_steps)
+    return False
 
 
 async def upload_csv(
@@ -71,13 +161,21 @@ async def upload_csv(
         page: Logged-in Playwright page.
         csv_path: Path to the DataSift-formatted CSV file.
         mode: "add" (create new + update existing) or "update" (update only).
-        list_name: Target list name. Required when existing_list=True.
+        list_name: Target list name. REQUIRED in both modes — there is no default.
+            Passing None or "" raises ListCategoryRequired rather than deriving one.
         existing_list: If True, select "Adding properties to an existing list"
             instead of creating a new list. The list must already exist in DataSift.
 
     Returns:
         Dict with upload results: {success, records_uploaded, errors, message}
+
+    Raises:
+        ListCategoryRequired: if list_name is missing or blank.
     """
+    # Checked before anything else: a missing category is a caller error, not a runtime
+    # condition, and it must never fall through to a derived name.
+    _require_list_name(list_name, existing_list)
+
     result = {
         "success": False,
         "records_uploaded": 0,
@@ -289,11 +387,9 @@ async def upload_csv(
             # New list mode: type a new list name
             list_input = page.locator('input[placeholder*="Enter new list name"], input[placeholder*="list name"]')
             if await list_input.count() > 0:
-                # Single stable list name — date moves to the per-record tag
-                # set (SiftStack YYYY-MM-DD) so we don't accumulate one DataSift
-                # list per Wednesday run.
-                if list_name is None:
-                    list_name = "SiftStack"
+                # list_name is guaranteed non-empty by _require_list_name above — a
+                # name is never derived here. The date stays on each record as a tag
+                # so we don't accumulate one DataSift list per Wednesday run.
                 await list_input.first.fill(list_name)
                 logger.info("Set list name: %s", list_name)
                 await page.wait_for_timeout(500)
@@ -305,14 +401,21 @@ async def upload_csv(
     # Click "Next Step" to proceed to step 2
     await _click_next_step(page, timeout=30000)
 
-    # ── Wizard Step 2: Add tags ──
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
+    # ── Wizard step: Add tags ──
+    # Reached by probing for the tag input, not by counting steps — see
+    # _advance_until. The live wizard order is Setup / Enrichment / Add tags /
+    # Upload the file / Map the columns / Review.
+    logger.info("Wizard step 'Add tags': adding 'Courthouse Data' tag...")
     await page.wait_for_timeout(1000)
+
+    tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
+    await _advance_until(
+        page, lambda: tag_input.count(), "tag input ('Add tags' step)", max_steps=3,
+    )
     await _screenshot(page, "step2_tags")
 
     # Add "Courthouse Data" tag via the Custom Tags input on the right side
     try:
-        tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
         if await tag_input.count() > 0:
             # Click input first, then type to trigger autocomplete dropdown
             await tag_input.first.click()
@@ -375,8 +478,8 @@ async def upload_csv(
 
     await _click_next_step(page)
 
-    # ── Wizard Step 3: Upload the file ──
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
+    # ── Wizard step: Upload the file ──
+    logger.info("Wizard step 'Upload the file': uploading CSV: %s", csv_path.name)
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step3_before_upload")
 
@@ -389,6 +492,15 @@ async def upload_csv(
             logger.debug("File input not found, waiting %dms...", wait)
             await page.wait_for_timeout(wait)
             file_input = page.locator('input[type="file"]')
+
+        # Still absent: we are probably parked on an earlier step (the
+        # "Enrichment" step added 2026-08-20 shifts everything after it).
+        # Advance by capability rather than failing on a step-index guess.
+        if await file_input.count() == 0:
+            await _advance_until(
+                page, lambda: file_input.count(),
+                "file input ('Upload the file' step)", max_steps=4,
+            )
 
         if await file_input.count() > 0:
             await file_input.first.set_input_files(str(csv_path))
@@ -1053,6 +1165,8 @@ async def upload_to_datasift(
     headless: bool = True,
     enrich: bool = True,
     skip_trace: bool = True,
+    list_name: str | None = None,
+    existing_list: bool = False,
 ) -> dict:
     """Full DataSift workflow: launch browser → login → upload CSV → enrich → skip trace.
 
@@ -1063,10 +1177,20 @@ async def upload_to_datasift(
         headless: Run browser in headless mode.
         enrich: Run "Enrich Property Information" after upload (default True).
         skip_trace: Run "Skip Trace" after upload (default True, uses unlimited plan).
+        list_name: Target DataSift list. REQUIRED — no default. The enrich and skip
+            trace steps filter on this same list.
+        existing_list: If True, add to that already-existing list instead of
+            creating a new one.
 
     Returns:
         Dict with upload results including enrich_result and skip_trace_result.
+
+    Raises:
+        ListCategoryRequired: if list_name is missing or blank.
     """
+    # Refuse before launching a browser or spending a login.
+    _require_list_name(list_name, existing_list)
+
     email = email or os.environ.get("DATASIFT_EMAIL", "")
     password = password or os.environ.get("DATASIFT_PASSWORD", "")
 
@@ -1102,12 +1226,11 @@ async def upload_to_datasift(
                 }
 
             # Upload CSV
-            result = await upload_csv(page, csv_path)
+            result = await upload_csv(page, csv_path, list_name=list_name,
+                                      existing_list=existing_list)
 
             if result.get("success"):
-                # Match the stable list name set by upload_csv — the date is
-                # carried on each record as a tag, not in the list name.
-                list_name = "SiftStack"
+                # Enrich and skip trace filter on the same list the upload targeted.
 
                 # Enrich property data via SiftMap
                 if enrich:

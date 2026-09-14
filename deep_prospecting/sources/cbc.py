@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 import requests
 
 from deep_prospecting._siftstack_bridge import firecrawl_fetch_full
+from deep_prospecting._utils import split_name
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,13 @@ def _slug(s: str) -> str:
 
 
 def _construct_listing_url(name: str, city: str, state_code: str) -> str | None:
-    parts = (name or "").strip().split()
-    if len(parts) < 2:
+    # split_name, not parts[-1]: a two-word surname slugged from the last token
+    # alone ("antoinette-duca" for Antoinette Del Duca) resolves to a DIFFERENT
+    # family, and the page returns HIT with no sign the query was not the name
+    # that was asked for.
+    first, last = split_name(name)
+    if not first or not last:
         return None
-    first, last = parts[0], parts[-1]
     name_slug = f"{_slug(first)}-{_slug(last)}"
     if city and state_code:
         return f"https://www.{_CBC_DOMAIN}/people/{name_slug}/{_slug(city)}-{_slug(state_code)}"
@@ -76,10 +80,9 @@ def _serper_fallback_url(name: str, city: str, state_code: str) -> str | None:
     api_key = os.environ.get("SERPER_API_KEY", "")
     if not api_key:
         return None
-    parts = (name or "").strip().split()
-    if len(parts) < 2:
+    first, last = split_name(name)
+    if not first or not last:
         return None
-    first, last = parts[0], parts[-1]
     query = f'"{first} {last}" {city} {state_code} site:{_CBC_DOMAIN}'.strip()
     try:
         resp = requests.post(

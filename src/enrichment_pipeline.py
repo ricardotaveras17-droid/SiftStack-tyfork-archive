@@ -88,6 +88,34 @@ ENRICHMENT_FLOORS: dict[str, tuple[int, int]] = {
 }
 
 
+# Why the last Zillow step produced what it did. Step 8 sets this in EVERY
+# branch (ran / no key / skipped / preserved / failed) and the health lines
+# render it, so "the provider was down" can never again look identical to
+# "these properties are not in Zillow". Both read as 0/72 without it, which
+# is what made the 2026-09-09 NJ run take a full investigation to explain.
+_LAST_ZILLOW: dict = {"note": ""}
+
+
+def _zillow_note(stats: dict) -> str:
+    """One-line reason for a Zillow fill rate, from the enricher's counters.
+
+    The distinction that matters operationally: API errors mean the data is
+    still out there and a csv-import re-run recovers it, while not_found means
+    the property genuinely is not in Zillow and re-running changes nothing.
+    """
+    errs = stats.get("api_errors", 0)
+    miss = stats.get("not_found", 0)
+    total = stats.get("total", 0)
+    if total and errs >= total:
+        return f"ALL {errs} calls failed - provider down, re-run to recover"
+    parts = []
+    if errs:
+        parts.append(f"{errs} API errors")
+    if miss:
+        parts.append(f"{miss} not in Zillow")
+    return ", ".join(parts)
+
+
 def compute_enrichment_health(notices: list["NoticeData"]) -> dict:
     """Compute per-field fill rates for monitoring.
 
@@ -122,6 +150,11 @@ def compute_enrichment_health(notices: list["NoticeData"]) -> dict:
 
     mls_hit = sum(1 for n in notices if n.mls_status)
     health["mls_status"] = _stat(mls_hit, total)
+
+    # Carry the Zillow outcome reason onto the fields it explains.
+    if _LAST_ZILLOW["note"]:
+        for _f in ("zillow_enriched", "estimated_value", "mls_status"):
+            health[_f]["note"] = _LAST_ZILLOW["note"]
 
     mailable_hit = sum(1 for n in notices if n.mailable == "yes")
     health["mailable"] = _stat(mailable_hit, total)
@@ -195,7 +228,11 @@ def evaluate_enrichment_health(
         else:
             marker = "✓"
 
-        lines.append(f"  {field}: {count}/{total} ({pct}%) {marker}")
+        note = stats.get("note")
+        lines.append(
+            f"  {field}: {count}/{total} ({pct}%) {marker}"
+            + (f"  [{note}]" if note else "")
+        )
 
     return lines, has_hard, has_soft
 
@@ -472,6 +509,10 @@ def run_enrichment_pipeline(
     nj_middlesex_probate, dropbox_watcher, scripts, tests) keep
     working without modification.
     """
+    # Clear last run's Zillow reason so an early return can't leave a
+    # stale note attached to this run's health lines.
+    _LAST_ZILLOW["note"] = ""
+
     # Closure that wraps each return point — `return_health` is a
     # keyword-only arg, so this stays in scope for all 5 returns
     # without threading it through.
@@ -718,27 +759,32 @@ def run_enrichment_pipeline(
         if config.OPENWEBNINJA_API_KEY:
             logger.info("── Step 8: Zillow Property Enrichment ──")
             try:
-                from property_enricher import enrich_properties
+                from property_enricher import LAST_RUN_STATS, enrich_properties
 
                 enrich_properties(notices, config.OPENWEBNINJA_API_KEY)
                 enriched = sum(1 for n in notices if n.estimated_value)
                 logger.info(
                     "  Zillow-enriched: %d/%d", enriched, len(notices)
                 )
+                _LAST_ZILLOW["note"] = _zillow_note(LAST_RUN_STATS)
             except ImportError:
                 logger.warning(
                     "  property_enricher not available — skipping"
                 )
+                _LAST_ZILLOW["note"] = "property_enricher unavailable"
             except Exception as e:
                 logger.warning("  Zillow enrichment failed: %s", e)
+                _LAST_ZILLOW["note"] = f"step failed: {e}"
         else:
             logger.info("── Step 8: Zillow (no API key configured) ──")
+            _LAST_ZILLOW["note"] = "no API key configured"
     elif opts.has_zillow:
         logger.info(
             "── Step 8: Zillow (preserved — data already present) ──"
         )
     elif opts.skip_zillow:
         logger.info("── Step 8: Zillow (skipped) ──")
+        _LAST_ZILLOW["note"] = "skipped"
 
     # ── Step 8b: Probate Ownership Verification ─────────────────────
     # Cross-check probate decedents against the MOD-IV owner of record

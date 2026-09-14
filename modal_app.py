@@ -602,7 +602,9 @@ async def nj_weekly_all():
             csv_infos = write_datasift_split_csvs(upload_ready, list_name="")
             if csv_infos:
                 upload_info = await upload_to_datasift(
+                    # Explicit target list — upload_csv no longer derives one.
                     csv_infos[0]["path"], enrich=True, skip_trace=True,
+                    list_name="SiftStack",
                 )
                 logger.info("DataSift upload: %s", upload_info.get("message", "OK"))
     except Exception as e:

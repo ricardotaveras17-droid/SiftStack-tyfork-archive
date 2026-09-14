@@ -116,6 +116,83 @@ async def _safe_call(
     return None
 
 
+# ── Name parsing ──────────────────────────────────────────────────────
+
+# Surname particles. A surname beginning at one of these tokens is multi-word:
+# "Antoinette Del Duca" is Del Duca, not Duca. Taking the last whitespace token
+# instead sent every CBC lookup on a two-word surname to a DIFFERENT family, and
+# made the MOD-IV comma form ("DEL DUCA, ANTOINETTE M" -> "del duca") compare
+# unequal to the caller form ("Antoinette Del Duca" -> "duca") for the same
+# person, which silently suppressed the same-surname death signal.
+_SURNAME_PARTICLES = frozenset({
+    "de", "del", "della", "dell", "di", "da", "das", "dos", "du", "degli",
+    "la", "le", "van", "von", "der", "den", "ter", "ten", "vander",
+    "st", "saint", "san", "santa", "al", "bin", "ibn", "abu", "mac",
+})
+
+# Stripped before the surname is read, never treated as the surname itself.
+_NAME_SUFFIXES = frozenset({
+    "jr", "sr", "ii", "iii", "iv", "v", "md", "do", "phd", "esq", "cpa",
+})
+
+_NAME_WS = re.compile(r"\s+")
+
+
+def split_name(name: str) -> tuple[str, str]:
+    """Split a free-text personal name into (first, surname).
+
+    Handles both orderings and multi-word surnames:
+
+        "Antoinette Del Duca"       -> ("Antoinette", "Del Duca")
+        "DEL DUCA, ANTOINETTE M"    -> ("ANTOINETTE", "DEL DUCA")
+        "John Smith"                -> ("John", "Smith")
+        "Maria De La Cruz"          -> ("Maria", "De La Cruz")
+        "Antoinette Del Duca Jr"    -> ("Antoinette", "Del Duca")
+
+    Case is preserved; callers lowercase when comparing. Returns ("", "") for
+    input with no usable tokens, and ("", token) for a single token, so a
+    caller can still tell "no name" from "surname only".
+
+    The comma form is authoritative when present: everything before the comma
+    is the surname, however many words it runs to. Without a comma, the surname
+    starts at the first particle after the first token, or at the last token if
+    there is no particle.
+    """
+    if not name:
+        return ("", "")
+    n = _NAME_WS.sub(" ", name.strip())
+    if not n:
+        return ("", "")
+
+    if "," in n:
+        surname, _, rest = n.partition(",")
+        surname = surname.strip()
+        rest_tokens = [t for t in rest.strip().split(" ") if t]
+        while rest_tokens and rest_tokens[-1].lower().strip(".") in _NAME_SUFFIXES:
+            rest_tokens.pop()
+        return (rest_tokens[0] if rest_tokens else "", surname)
+
+    tokens = [t for t in n.split(" ") if t]
+    while len(tokens) > 2 and tokens[-1].lower().strip(".") in _NAME_SUFFIXES:
+        tokens.pop()
+    if not tokens:
+        return ("", "")
+    if len(tokens) == 1:
+        return ("", tokens[0])
+
+    # Never treat the first token as a particle - a given name is not a particle,
+    # and "Del" alone as a first name would otherwise swallow the whole string.
+    for i in range(1, len(tokens) - 1):
+        if tokens[i].lower().strip(".") in _SURNAME_PARTICLES:
+            return (tokens[0], " ".join(tokens[i:]))
+    return (tokens[0], tokens[-1])
+
+
+def last_name(name: str) -> str:
+    """Lowercased surname, for comparison. See split_name."""
+    return split_name(name)[1].lower()
+
+
 # ── Filesystem helpers ────────────────────────────────────────────────
 
 _SLUG_NON_ALNUM = re.compile(r"[^a-z0-9]+")

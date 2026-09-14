@@ -1,0 +1,54 @@
+{
+  "deal_name": "123 Main St, Newark NJ",
+  "date": "2026-08-20",
+  "lender_name": "[LENDER LEGAL NAME]",
+  "closing_agent": "[NJ CLOSING ATTORNEY]",
+  "terms_assumed": true,
+  "contract_price": 196000,
+  "work_budget": 102000,
+  "borrower": {
+    "entity": "[YOUR LLC LEGAL NAME]",
+    "state": "NJ",
+    "formation": "a New Jersey limited liability company",
+    "members": ["[MEMBER 1]", "[MEMBER 2]"]
+  },
+  "property": {
+    "full_address": "123 Main St, Newark, NJ 07103",
+    "short_address": "123 Main St",
+    "county": "Essex",
+    "state": "NJ",
+    "type": "Single family detached, two story",
+    "sqft": 1400, "beds": 3, "baths": 2, "year_built": 1955,
+    "condition": "Vacant, dated throughout, roof and systems at end of life",
+    "occupancy": "Vacant at closing"
+  },
+  "loan": {
+    "amount": 253300, "rate": 0.12, "points": 2,
+    "term_months": 9, "min_interest_months": 3, "draws": 4,
+    "lien": "First lien, mortgage recorded with the Essex County Clerk",
+    "payment": "No monthly payments. Principal and accrued interest due at payoff."
+  },
+  "resale": { "point": 400000, "lo": 380000, "hi": 420000 },
+  "as_is": { "point": 245000 },
+  "holding": { "taxes_annual": 9200, "insurance_annual": 1800, "utilities_monthly": 200 },
+  "buying_costs": { "attorney": 1500, "title_pct": 0.006 },
+  "selling_costs": { "realtor_pct": 0.05 },
+  "repair_lines": [
+    {"item": "Roof, tear-off and replace", "cost": 14500, "note": "3-tab to architectural"},
+    {"item": "Kitchen, full replace", "cost": 21000, "note": "Tier 2 builder grade"},
+    {"item": "Bathrooms (2)", "cost": 16500, "note": ""},
+    {"item": "HVAC, full system", "cost": 11000, "note": "No existing ductwork"},
+    {"item": "Electrical, panel and partial rewire", "cost": 9500, "note": ""},
+    {"item": "Plumbing, repipe", "cost": 8000, "note": "Galvanised throughout"},
+    {"item": "Flooring and paint", "cost": 13500, "note": "1,400 sqft"},
+    {"item": "Exterior, siding and landscaping", "cost": 8000, "note": ""}
+  ],
+  "comps": [
+    {"address": "118 Elm St", "sold_price": 405000, "sqft": 1450, "beds_baths": "3/2",
+     "sold_date": "2026-06-14", "note": "Renovated, same pocket"},
+    {"address": "42 Grove Ter", "sold_price": 392000, "sqft": 1360, "beds_baths": "3/2",
+     "sold_date": "2026-05-30", "note": "Renovated"},
+    {"address": "9 Park Pl", "sold_price": 415000, "sqft": 1520, "beds_baths": "3/2.5",
+     "sold_date": "2026-07-08", "note": "Slightly larger, extra half bath"}
+  ]
+}
